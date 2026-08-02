@@ -1,0 +1,3 @@
+# Replace legacy health skills with thin adapters
+
+Health Engine will be the sole structured-record and deterministic-analysis authority. A generic Health Engine skill will expose its Workspace, schema, Source, Health Record, Verification, Correction, Analysis, and migration-audit workflows; the legacy intake skill will become a thin filing and extraction adapter, and the assessment-report skill will become a presentation adapter over Health Record queries and complete Analysis JSON rather than maintaining parallel CSV or Markdown databases. Migration testing occurs in the gitignored `tmp/` working copy, and the original personal archive remains read-only until a separately authorized cutover.

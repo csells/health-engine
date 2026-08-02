@@ -1,0 +1,3 @@
+# Limit human interruption to answerable decisions
+
+Health Engine, deterministic parsers, independent source-fidelity checks, rules, and reference-data conformance own technical and clinical data quality; humans are not asked to adjudicate whether extracted or interpreted health data is medically correct. Skills interrupt an Operator only for identity, explicit self-reports, current preferences, clinician-question selection, or destructive authorization, recording those answers as their own sourced assertions rather than proof that another Source was wrong; unresolved technical or clinical ambiguity remains quarantined, visible, and unable to silently drive Guidance.

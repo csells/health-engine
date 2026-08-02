@@ -13,6 +13,6 @@ Health Engine does not diagnose disease or replace a clinician. Outputs may be i
 - Agents and applications file original health documents and extract structured facts.
 - Health Engine validates and stores those facts in a SQLite database inside the user's Workspace.
 - Public reference data is downloaded separately and is never bundled into this MIT-licensed repository.
-- Every conclusion carries provenance, verification state, and confidence.
+- Every conclusion traces its provenance, origin-appropriate Evidence Assurance, and confidence.
 
 See the [vision](specs/vision/health-engine-vision.md) and [implementation plan](specs/plans/health-engine-implementation-plan.md).

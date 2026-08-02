@@ -1,0 +1,3 @@
+# Preserve familiar report entry points as derived views
+
+The migrated Workspace will preserve `reports/HEALTH_REPORT.html` as the primary layperson report, `reports/PHYSICIAN_SUMMARY.md` as the provider-facing summary, and `reports/current/health-summary.md` and `open-loops.md` as convenient readable views. One deterministic Renderer publishes all four atomically as a Report Bundle from an immutable Record Snapshot, its matching complete Analysis, and explicit render context. Each view exposes generation time, record revision, Analysis identity, and structured claim identities; replacement skills retain the existing natural-language interactions, while any agent-authored narrative remains separate and non-authoritative.

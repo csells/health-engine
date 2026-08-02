@@ -1,0 +1,3 @@
+# Use Migration Differences as engineering verification evidence
+
+Legacy-versus-current differences are owned by the implementation and migration process, not delegated to the Subject. Every substantive difference must result in a fixed engine or ingestion defect, or an evidence-backed explanation that the legacy result was wrong, unsupported, deduplicated, or changed by newer reference data; internal reconciliation artifacts remain in the ignored migration workspace, while final handoff reports only the remaining differences and their explanations. Clean replay comparison pins identical Installed Data and uses a canonical logical export plus a checked-in normalization schema that removes only enumerated volatile metadata, never clinical meaning or evidence.

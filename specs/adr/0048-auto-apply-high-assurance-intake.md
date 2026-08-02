@@ -1,0 +1,3 @@
+# Auto-apply routine high-assurance intake
+
+An Operator's request to process intake, add a result, or record a reading authorizes ordinary additions when identity, origin-appropriate Evidence Assurance, validation, and concurrency checks pass. Deterministic file evidence retains parser validation, document extraction requires source fidelity, and a clear direct statement remains explicitly attributed self-report rather than being mislabeled Verified. The skill proposes and applies those changes automatically and returns a concise Commit Receipt; it interrupts only for uncertain identity, genuinely ambiguous self-report, a serious conflict affecting Guidance, or destructive authorization, while Source-demonstrated Corrections must be shown clearly in the receipt.

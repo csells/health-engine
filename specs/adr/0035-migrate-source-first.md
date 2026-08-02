@@ -1,0 +1,3 @@
+# Migrate legacy health repositories source-first
+
+Legacy migration will treat original clinical documents and genome exports as Sources, reconcile structured observations to those Sources or explicit self-reports, and use living or generated reports only as coverage and expected-output oracles. A claim found only in derived material remains a Migration Candidate until confirmed; migration is complete when every input and candidate is accounted for as accepted, deduplicated, rejected with a reason, or quarantined with a technical disposition, rather than when every sentence has been converted into a Health Fact.

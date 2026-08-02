@@ -29,4 +29,4 @@ History is currently minimal, so use short imperative commit subjects, for examp
 
 ## Security & Data Boundaries
 
-Never commit personal health data, Workspace databases, secrets, or downloaded third-party reference datasets. Keep accepted facts append-only, use forward-only migrations, and preserve provenance and verification state in every data-model change.
+Never commit personal health data, Workspace databases, secrets, or downloaded third-party reference datasets. Keep accepted facts append-only except for the explicitly Operator-authorized Expungement contract, use forward-only migrations, and preserve provenance and origin-appropriate Evidence Assurance in every data-model change. Keep private migration copies, databases, manifests, logs, and comparison artifacts only under ignored `tmp/`; never modify the original health repository during migration validation.

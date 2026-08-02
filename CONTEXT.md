@@ -1,16 +1,24 @@
 # Health Engine
 
-A public, MIT-licensed, user-agnostic domain for turning supplied health evidence into deterministic, provenance-rich findings. It exists so many private workspaces, skills, and applications can share one interpretation engine without sharing personal data. Third-party reference data is acquired directly from its public sources into an untracked local cache and is not redistributed in the repository, crate, or binary.
+A public, MIT-licensed, user-agnostic domain for turning supplied health evidence into deterministic, provenance-rich findings. It exists so many private workspaces, skills, and applications can share one interpretation engine without sharing personal data. Third-party reference data is acquired directly from its public sources into a configured untracked local cache and is not redistributed in the tracked repository, crate, or binary.
 
 ## Language
 
 **Health Engine**:
-The deterministic processor and workspace API that stores validated Health Facts in a user-owned Workspace, applies reference data and evidence rules, and produces structured Analyses. It does not perform model-based document interpretation or narrative synthesis, and it never places personal data in the OSS repository or public-data cache.
+The deterministic processor and workspace API that stores validated Health Facts in a user-owned Workspace, applies reference data and evidence rules, and produces structured Analyses. It does not perform model-based document interpretation or narrative synthesis, and it never places personal data in tracked or distributed project artifacts or the public-data cache.
 _Avoid_: Analyzer, pipeline, health assistant
 
 **Health Fact**:
 A typed, structured fact written and queried through the Health Engine, such as a genomic call, lab result, vital measurement, medication event, symptom answer, or care follow-up. It preserves when it happened, who or what reported it, and where it came from. Agents may extract Health Facts from messy documents or conversations, but the engine validates and persists them.
 _Avoid_: Document, model interpretation, unsourced assertion
+
+**Evidence Assurance**:
+The origin-appropriate validation basis carried by a Health Fact: parser-validated machine-readable evidence, source-verified document extraction, explicitly attributed self-report, or unverified extraction. These are distinct bases rather than a false universal ranking; policy decides how each may support a Finding or Guidance, and quarantine is not an assurance level.
+_Avoid_: Confidence, clinical truth, generic verified flag, user approval
+
+**Clinical Time**:
+The source-faithful representation of when a Health Fact was effective or observed, including an exact instant, date, interval, or partial date with explicit precision. It never invents a missing timezone or calendar component and remains distinct from when Health Engine recorded the Fact.
+_Avoid_: Recording time, guessed timestamp, report date
 
 **Lab Result**:
 A Health Fact for one measured or qualitative test result, carrying its collection time, original test name, value, units, the reporting lab's reference range and flag, and a source reference. The engine uses Lab Results for longitudinal trends without replacing one lab's range with another's or treating an unmeasured test as normal.
@@ -60,6 +68,10 @@ _Avoid_: Report, output, results
 A clinically actionable step supported directly by a Reference Source, such as CPIC medication guidance or ACMG follow-up. It carries its source, strength, prerequisites, and uncertainty and never extends beyond what that source supports.
 _Avoid_: Agent advice, inferred treatment, generic wellness tip
 
+**Subject Preference**:
+An explicit choice by the Subject about tracking, presentation, or a personal routine. It may shape a Care Protocol or Renderer but is not clinician instruction or source-backed Guidance.
+_Avoid_: Guidance, clinician order, medical requirement
+
 **Confidence**:
 One of `High`, `Moderate`, `Low`, `Conflicting`, or `Unknown`, with a plain-language rationale, attached to every Finding and Guidance claim alongside the source's original evidence rating. Confidence is part of the structured Analysis and appears in every CLI rendering.
 _Avoid_: Hidden threshold, report-section proxy, impact score
@@ -69,16 +81,28 @@ A genomic evidence stream whose file format and genome build have been positivel
 _Avoid_: Generic four-column file, best-effort parsing
 
 **Renderer**:
-A presentation adapter that turns an Analysis into terminal text, Markdown, or another human-readable form without adding, removing, or reinterpreting clinical meaning.
+A deterministic presentation adapter that turns a Record Snapshot and its Analysis into terminal text, JSON, Markdown, HTML, or a Report Bundle without adding, removing, or reinterpreting clinical meaning.
 _Avoid_: Analyzer, report generator
+
+**Record Snapshot**:
+An immutable logical view of the Health Record at one revision, used with a matching Analysis to make rendering and replay deterministic.
+_Avoid_: Database backup, mutable current view, report
+
+**Report Bundle**:
+The atomically published set of required derived report files produced by one Renderer invocation from a Record Snapshot, matching Analysis, and explicit render context. Every substantive statement maps to a structured claim identity; agent-authored narrative remains separate and non-authoritative.
+_Avoid_: Living database, agent rewrite, independent report state
 
 **Reference Source**:
 One independently updated public evidence source, such as ClinVar, ClinGen, CPIC, ClinPGx, or the GWAS Catalog. A source may publish several files that must be interpreted together.
 _Avoid_: Bundled database
 
 **Installed Data**:
-The current local copy of each Reference Source, including its version and provenance. Analysis always uses the installed data. An explicit update replaces an older copy with a newer one.
+The current local copy of each Reference Source at an explicit cache root, including its version and provenance. Analysis always uses the installed data selected for the operation. An explicit update replaces an older copy with a newer one.
 _Avoid_: Snapshot, release, active pack
+
+**Legacy Reference Baseline**:
+The recorded digests and available version or provenance metadata for public reference resources that produced a legacy Analysis. It exists to explain and compare historical claims but is not the Installed Data used for a current Analysis.
+_Avoid_: Installed Data, current data, bundled data
 
 **Curated Variant Knowledge**:
 The small, project-maintained set of genetic variants and interpretations shipped with the engine. Every entry is verified, corrected, and supported by cited sources before it can produce a finding or guidance.
@@ -109,24 +133,60 @@ The person, agent, or application acting on a Workspace. An Operator may be the 
 _Avoid_: Subject, patient identity
 
 **Source**:
-An original user-supplied health artifact—such as a lab PDF, visit summary, image, or genome export—filed and preserved in the Workspace by an agent or application. Health Engine stores the source reference and location supplied with each extracted Health Fact but does not manage the file.
+An original user-supplied health artifact—such as a lab PDF, visit summary, image, or genome export—filed and preserved in the Workspace by an agent or application. Health Engine may read its bytes only to validate content identity, size, media type, and aliases; it stores a private digest behind an opaque Source ID but never copies, moves, deletes, or interprets the file.
 _Avoid_: Health Fact, extraction, generated report
+
+**Source Alias**:
+A Workspace-relative path that resolves to the same content-addressed Source as another path. It preserves where identical bytes were encountered without creating a second Source identity.
+_Avoid_: Source, duplicate fact, copied evidence
+
+**Migration Candidate**:
+A possible Health Fact that migration cannot accept because it appears only in derived legacy material or has incomplete or failed source-fidelity evidence. It remains outside the canonical Health Record with an explicit technical disposition until it gains valid Source evidence or is confirmed as a self-report.
+_Avoid_: Health Fact, Source, accepted fact
+
+**Migration Difference**:
+A substantive difference between a legacy result and the Health Engine migration result. It is verification evidence that must lead to a fixed implementation or ingestion defect, or to an evidence-backed explanation that the legacy result was wrong or superseded; it is not a decision delegated to the Subject.
+_Avoid_: User review item, unexplained parity failure, cosmetic diff
 
 **Health Record**:
 The canonical structured store inside a Workspace. Health Facts, corrections, source provenance, and care state are created, validated, written, and queried only through Health Engine interfaces.
 _Avoid_: Agent-authored CSV, living Markdown, public database
 
+**Record Change Set**:
+An atomic collection of proposed additions, Corrections, Verifications, Reconciliations, and provenance for one explicit Workspace and Subject. It carries its schema version, evidence origin and references, extractor identity, idempotency key, and expected record revision.
+_Avoid_: Ad hoc write, partial import, SQL transaction
+
+**Extraction Run**:
+A versioned attempt by an identified extractor to examine a declared scope of one Source and propose Health Facts. It records the regions and domains examined, omissions, failures, and coverage needed to distinguish `not found` from `not looked for`; a Source may have multiple Extraction Runs.
+_Avoid_: Source, Health Fact, Analysis, whole-document assumption
+
+**Record Proposal**:
+The immutable result of validating a Record Change Set without changing canonical state. It identifies the exact proposed effects, safety findings, impact, and content hash that may later be committed.
+_Avoid_: Health Fact, accepted change, preview prose
+
+**Commit Receipt**:
+The durable result of applying a Record Proposal, including the new record revision, accepted identities, deduplication outcomes, and newly stale Analyses. Repeating the same idempotent request returns the same receipt.
+_Avoid_: Report, log message, Analysis
+
 **Verification**:
-A status and auditable comparison between a Health Fact and its immutable Source. A new extraction begins `Unverified`; a check records who or what reviewed it, when, the source location checked, and whether it became `Verified` or a Discrepancy was found.
-_Avoid_: Assumption, silent review, source-free approval
+A status and auditable source-fidelity comparison between a Health Fact and its immutable Source. It establishes that the fact was transcribed faithfully, not that the Source's medical claim is clinically true; a check records who or what reviewed it, when, the exact location checked, and whether it became `Verified` or a Discrepancy was found.
+_Avoid_: Clinical validation, assumption, silent review, source-free approval
 
 **Discrepancy**:
 A recorded disagreement between structured Health Facts, an immutable Source, or two Sources. It remains visible until explicitly resolved and never silently rewrites either source or history.
 _Avoid_: Overwrite, hidden correction, stale note
 
+**Reconciliation**:
+An auditable relationship stating that Health Facts from different Sources describe the same observation and whether they agree. It preserves every Source-specific Fact while allowing normal views to present equivalent observations once.
+_Avoid_: Correction, merge, deletion, fuzzy deduplication
+
 **Correction**:
 An append-only Health Fact that replaces an earlier fact as the current interpretation while preserving the original, the reason for change, supporting evidence, author, and time.
 _Avoid_: UPDATE, edit in place, deletion
+
+**Expungement**:
+An explicitly Operator-authorized destruction of PHI-bearing record entries and derived artifacts under Health Engine control after a wrong-Subject import, accidental sensitive ingestion, or deliberate privacy request. It retains only a fixed-code non-PHI audit tombstone, reports external Source and backup remediation to the host, and is never an ordinary Correction or autonomous agent action.
+_Avoid_: Correction, routine deletion, redaction, agent cleanup
 
 **Care Task**:
 A structured follow-up recorded in the Health Record, such as a repeat test, referral, appointment, or awaited result. It carries what is due, when or at what interval, who requested it, its source, and its current state.

@@ -1,6 +1,7 @@
 /target/
 /.DS_Store
 /.health-engine/
+/tmp/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal

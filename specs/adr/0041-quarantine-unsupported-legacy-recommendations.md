@@ -1,0 +1,3 @@
+# Quarantine unsupported legacy recommendations
+
+Legacy recommendations will enter current Guidance only when Health Engine can preserve the exact Reference Source recommendation, strength, prerequisites, qualifications, and applicable evidence. Explicit personal routines may be retained as Subject Preferences, while unsupported recommendations remain Migration Candidates or historical narrative with an exclusion reason; report compatibility will not justify promoting them, and migration will not use open-ended medical web research to rescue them outside the accepted reference-data or curated-knowledge process.
