@@ -1,0 +1,3 @@
+# Store medications as an event timeline
+
+Health Engine will represent medications and supplements through dated Medication Events: start, stop, dose or schedule change, missed dose, and as-needed use. Events preserve the name, normalized identity when known, dose, units, route, schedule, indication, effective time, source, and relevant adherence context. The engine derives the regimen in effect at any point and may compare subsequent labs, Vital Measurements, symptoms, and pharmacogenomic guidance with that timeline. It reports temporal relationships as such and does not claim that a medication caused an observed change unless cited evidence supports the claim.

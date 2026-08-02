@@ -1,0 +1,3 @@
+# Preserve every Health Fact and Correction
+
+Health Engine will never edit or delete an accepted Health Fact in place. When extraction, verification, or later evidence shows that a fact is wrong or incomplete, the engine records an append-only Correction that references the earlier fact, explains the change, cites its supporting Source or Verification, and records its author and time. Normal queries resolve the corrected value as current while audit queries expose the complete chain. Analyses record the fact identities they used so a conclusion can be traced to the exact record state that produced it.

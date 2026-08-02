@@ -1,0 +1,3 @@
+# Include source-backed actionable guidance
+
+Analysis will include clinically actionable guidance supported directly by installed reference data, not only evidence matches. This includes capabilities such as CPIC medication guidance and ACMG follow-up recommendations. Every guidance item must cite the source recommendation, preserve its strength and qualifications, state the observed evidence and prerequisites that made it applicable, and expose uncertainty or missing coverage. The engine may structure and explain source guidance but may not invent, strengthen, or personalize a treatment beyond what the source supports. Renderers and agent adapters consume this structured guidance rather than creating clinical actions independently.

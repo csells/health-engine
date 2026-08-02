@@ -1,0 +1,3 @@
+# Make the structured Analysis the primary public contract
+
+The Health Engine's primary result is a versioned Rust `Analysis` value with a documented JSON representation. It contains every finding, source-backed guidance, exclusion, warning, evidence reference, policy decision, input fact needed for interpretation, engine version, and the version and provenance of every installed reference source used. A checked-in JSON Schema will describe each supported representation version. Terminal text, Markdown, and future presentation formats are Renderers over the same Analysis and must not contain clinical meaning absent from the structured value. This replaces the existing pipelines' split contracts, where Markdown contains results that their JSON omits.

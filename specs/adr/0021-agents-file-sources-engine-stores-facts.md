@@ -1,0 +1,3 @@
+# Let agents file Sources while Health Engine stores their extracted facts
+
+Agents and applications will process intake folders, identify source documents, choose meaningful names and subfolders, and preserve the resulting files in the user's Workspace. They will also extract structured Health Facts and submit those facts to Health Engine with workspace-relative source references and precise page, section, table, row, or quote locations where available. Health Engine validates and records the facts and provenance in SQLite but does not copy, name, route, move, or delete the underlying files. This keeps document judgment in agent workflows while giving every workflow one canonical structured record.

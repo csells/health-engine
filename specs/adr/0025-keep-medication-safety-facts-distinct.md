@@ -1,0 +1,3 @@
+# Keep medication safety facts distinct
+
+Health Engine will store allergies, intolerances, adverse reactions, contraindications, and prescribing cautions as separate typed Medication Safety Facts rather than entries in the medication timeline or an undifferentiated allergy list. Each fact preserves the implicated substance, what happened, severity, timing when known, certainty, verification, source, and current status. The engine may surface safety guidance prominently, but it will not silently promote an intolerance or uncertain chart entry into a confirmed allergy, nor erase a documented reaction when a later record disagrees.

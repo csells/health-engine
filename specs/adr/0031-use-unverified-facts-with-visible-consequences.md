@@ -1,0 +1,3 @@
+# Use unverified extractions without treating them as verified
+
+New agent-extracted Health Facts may participate in queries and Analyses before a second source-review pass, but they begin with `Unverified` status. That status propagates to every dependent Finding and Guidance item, lowers its Confidence, and produces a visible warning where the conclusion could affect care. The structured Analysis identifies exactly which unverified facts it used. A later source comparison records Verification or a Discrepancy without rewriting the original extraction. Callers may also request verified-only queries when appropriate.

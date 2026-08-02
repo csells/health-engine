@@ -1,0 +1,3 @@
+# Accept structured Health Facts rather than interpreting documents
+
+The Health Engine will accept typed, structured Health Facts and will not attempt to understand arbitrary PDFs, screenshots, images, portal exports, or conversations. Agents and applications own extraction and supply the value, time, source reference, and extraction certainty needed by the engine. The engine validates and writes those facts into the Workspace's Health Record, preserves their provenance and corrections, and performs deterministic analysis across them. This keeps model-dependent document interpretation outside the Rust core while allowing every adapter to share the same storage, query, and downstream health logic.

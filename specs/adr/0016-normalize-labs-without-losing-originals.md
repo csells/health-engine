@@ -1,0 +1,3 @@
+# Normalize equivalent Lab Results without losing their originals
+
+The Health Engine will map confidently equivalent laboratory names to a Canonical Test and convert values into a common unit only when the conversion is exact and supported. This allows one longitudinal trend to span labs that use different names or units. Every normalized result retains the original name, value, units, reference range, flag, and source reference. If the engine cannot establish that two results are equivalent or safely convertible, it keeps them separate and emits a visible warning rather than manufacturing a trend.

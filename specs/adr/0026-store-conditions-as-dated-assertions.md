@@ -1,0 +1,3 @@
+# Store conditions as dated assertions
+
+Health Engine will represent diagnoses and health conditions as dated, sourced Condition Assertions with explicit states such as suspected, confirmed, ruled out, inactive, and resolved. It will derive the current condition picture from the assertion and Correction history instead of overwriting a mutable problem list. Conflicting sources remain visible, and “ruled out after testing,” “not found in this source,” and “never evaluated” remain different states. An old suspicion cannot silently become a current diagnosis merely because it appeared in a prior record.

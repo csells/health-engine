@@ -1,0 +1,3 @@
+# Store care protocols without inventing their medical content
+
+Health Engine will provide a structured Care Protocol mechanism for reusable questions, observations, and time-sensitive actions associated with a Subject's condition or recurring event. Protocol content must identify its origin: a clinician's order or care plan, instructions in a Source, a cited clinical guideline, the Subject's explicit tracking preference, or an agent suggestion that was explicitly accepted and remains labeled as such. The engine stores, retrieves, validates, and applies the protocol but does not invent personalized medical questions or present generic agent prompts as clinician-directed or medically required.

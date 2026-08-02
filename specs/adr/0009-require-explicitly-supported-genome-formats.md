@@ -1,0 +1,5 @@
+# Require an explicitly supported genome format and build
+
+The first genome importer will support verified 23andMe raw genome files. The Rust library may also accept already-normalized genomic evidence through a typed interface, but the CLI will not treat an arbitrary four-column file as compatible. Before writing genomic facts, it must positively identify and validate both the input format and genome build. Unknown, ambiguous, malformed, or unsupported input fails immediately rather than producing partial or guessed findings.
+
+The library will return a structured `UnsupportedGenomeFormat`, `UnsupportedGenomeBuild`, or `InvalidGenomeInput` error as appropriate. CLI diagnostics will state what could be detected, list supported formats and builds, and explain that the format needs a fixture and parser before it can be analyzed. Diagnostics must be useful to humans and agents without echoing genotype records or otherwise leaking genomic data. Additional formats will be added only with representative fixtures and explicit parser tests.

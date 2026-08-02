@@ -1,0 +1,3 @@
+# Leave whole-Workspace encryption to the host
+
+Health Engine will not encrypt a Workspace at rest or claim that its SQLite database is secure while agent-accessible source files remain plaintext. The containing application, encrypted filesystem, or vault is responsible for protecting the entire Workspace directory. Health Engine will operate only on the explicitly opened Workspace, create no hidden personal-data copies, emit no health-data telemetry, and make its temporary-file behavior auditable. An encrypted health-vault application may decrypt or mount a Workspace and then use the same engine.

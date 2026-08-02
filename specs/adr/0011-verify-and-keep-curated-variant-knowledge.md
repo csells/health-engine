@@ -1,0 +1,3 @@
+# Verify and keep the existing curated variant knowledge
+
+The useful hand-written variant interpretations from the existing health repositories will seed a small, project-maintained knowledge base shipped with the MIT-licensed engine. They will not be copied blindly from the Python dictionaries. Each entry must be checked for the correct variant, gene, alleles, orientation, genome build, interpretation, and supporting sources before it can produce a finding or actionable guidance. Known corrections from the health-tracker plugin are part of this reconciliation. Entries that have not yet been verified remain unavailable rather than being presented as clinical fact.

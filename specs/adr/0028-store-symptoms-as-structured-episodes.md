@@ -1,0 +1,3 @@
+# Store symptoms as structured episodes without paraphrasing
+
+Health Engine will store recurring attacks, flares, and other symptom events as structured Symptom Episodes. Each episode may include onset, activity or position, phases, duration, time to recovery, the Subject's exact quoted descriptions, associated symptoms and laterality, possible triggers, treatments and response, witness observations, media references, and source provenance. Symptom answers distinguish `present`, `absent`, `unknown`, and `not asked`; a blank is never treated as a negative. The engine may calculate frequency, recurring patterns, and deviations from prior episodes but will not translate the Subject's words into a diagnosis or clinically loaded paraphrase.

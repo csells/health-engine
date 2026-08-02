@@ -1,0 +1,3 @@
+# Make the Rust library the primary module
+
+The primary Health Engine product will be a Rust library, with the `health-engine` CLI as an adapter over it. The library exposes explicit Workspace/SQLite operations, public reference-data management, and deterministic analysis through structured values; it performs no ambient filesystem discovery or hidden network access. CLI discovery, terminal presentation, and process exit behavior remain adapter concerns. This preserves one shared test surface for Rust callers, agents, and applications while leaving room for future process, FFI, or WebAssembly adapters.

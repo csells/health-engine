@@ -1,0 +1,3 @@
+# Build the Health Engine as a public MIT-licensed project
+
+The Health Engine will be developed publicly for reuse by unrelated users, agents, skills, and applications—not as an extraction of one person's private health repository. The repository, crate, and distributed binaries will contain no personal health data, personal defaults, patient-specific interpretations, or third-party reference datasets. The original code and checked-in source/build manifests will use the MIT license. Users acquire governed data directly from its public sources under the source's own terms, preserving full engine functionality without redistributing that data as part of the project.

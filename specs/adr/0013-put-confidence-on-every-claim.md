@@ -1,0 +1,3 @@
+# Put confidence on every emitted claim
+
+Every Finding and Guidance claim emitted by the Health Engine will include one of five confidence categories—`High`, `Moderate`, `Low`, `Conflicting`, or `Unknown`—a plain-language rationale for that category, and the original confidence or evidence ratings supplied by its Reference Sources. Confidence is part of the structured Analysis contract, not an implicit consequence of which report section contains the claim. Source-specific mapping rules will be documented and testable. Terminal, Markdown, and JSON output must all expose confidence. Excluded evidence remains visible with its exclusion reason rather than masquerading as a low-confidence claim.

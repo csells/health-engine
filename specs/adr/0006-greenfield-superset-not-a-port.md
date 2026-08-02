@@ -1,0 +1,3 @@
+# Build a greenfield superset rather than porting an existing pipeline
+
+The Health Engine is a new Rust crate and CLI inspired by the useful capabilities, evidence, lessons, and failure cases found across the existing health repositories. None of those repositories defines a compatibility contract. The new domain model, APIs, CLI, analysis schema, policies, and outputs may depart freely from their Python implementations and report formats. Existing behavior is retained only when it is supported by evidence and fits the new architecture. The goal is the best coherent superset of reusable health-engine capabilities, with correctness and explainability taking priority over backward compatibility.
