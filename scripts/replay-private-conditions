@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+"""Replay private condition assertions through public CLI seams without disclosure."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+CURRENT_TREATMENT = re.compile(r"^([A-Za-z][A-Za-z -]{1,80})\s+\(on\b", re.I)
+STAGED_DIAGNOSIS = re.compile(r"\b(?:cancer|carcinoma|neoplasm)\b", re.I)
+STAGING_LANGUAGE = re.compile(r"\b(?:gleason|grade|stage|localized|confirmed)\b", re.I)
+
+
+class ReplayError(Exception):
+    pass
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def run_cli(
+    binary: Path,
+    workspace: Path,
+    arguments: list[str],
+    payload: dict[str, Any],
+    log: Path,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(binary), "--workspace", str(workspace), "--json", *arguments],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        log.write_text(process.stderr, encoding="utf-8")
+        log.chmod(0o600)
+        raise ReplayError("cli_failed")
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("invalid_cli_output") from error
+
+
+def normalized_identity(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def context_bullets(document: Path) -> list[tuple[int, int, str]]:
+    lines = document.read_text(encoding="utf-8").splitlines()
+    active = False
+    bullets: list[tuple[int, int, str]] = []
+    start = 0
+    fragments: list[str] = []
+
+    def finish(end: int) -> None:
+        nonlocal start, fragments
+        if fragments:
+            bullets.append((start, end, " ".join(fragment.strip() for fragment in fragments)))
+        start = 0
+        fragments = []
+
+    for line_number, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        lower = stripped.lower()
+        if stripped.startswith("## ") and "current health context" in lower:
+            active = True
+            continue
+        if not active:
+            continue
+        if stripped.startswith("## "):
+            finish(line_number - 1)
+            break
+        if stripped.startswith("- "):
+            finish(line_number - 1)
+            start = line_number
+            fragments = [stripped[2:]]
+        elif fragments and stripped:
+            fragments.append(stripped)
+    else:
+        finish(len(lines))
+    if not active or not bullets:
+        raise ReplayError("condition_source_incomplete")
+    return bullets
+
+
+def classify_bullet(start: int, end: int, text: str) -> list[dict[str, Any]]:
+    lower = text.lower()
+    candidates: list[tuple[str, str]] = []
+    if lower.startswith("history of "):
+        candidates.append((text[len("history of "):].split("(", 1)[0].strip(), "inactive"))
+    elif STAGED_DIAGNOSIS.search(text) and STAGING_LANGUAGE.search(text):
+        candidates.append((text.split("(", 1)[0].strip(), "confirmed"))
+    elif match := CURRENT_TREATMENT.match(text):
+        candidates.append((match.group(1).strip(), "confirmed"))
+    else:
+        parts = [part.strip() for part in text.split(",")]
+        if len(parts) > 1 and all(part.lower().endswith("intolerance") for part in parts):
+            candidates.extend((part, "confirmed") for part in parts)
+    locator = f"lines:{start}-{end}" if start != end else f"line:{start}"
+    return [
+        {
+            "locator": locator,
+            "state": state,
+            "name": name,
+            "normalized_identity": normalized_identity(name),
+            "body_site": None,
+            "assertion_text": text,
+        }
+        for name, state in candidates
+        if name
+    ]
+
+
+def parse_conditions(document: Path) -> list[dict[str, Any]]:
+    conditions = [
+        condition
+        for start, end, text in context_bullets(document)
+        for condition in classify_bullet(start, end, text)
+    ]
+    identities = [condition["normalized_identity"] for condition in conditions]
+    if not conditions or len(identities) != len(set(identities)):
+        raise ReplayError("condition_classification_invalid")
+    return conditions
+
+
+def build_change_set(
+    init: dict[str, Any], source_id: str, conditions: list[dict[str, Any]]
+) -> dict[str, Any]:
+    reporter = {"kind": "subject", "identifier": "migration-subject"}
+    regions = sorted({condition["locator"] for condition in conditions})
+    changes = []
+    for condition in conditions:
+        fact = {key: value for key, value in condition.items() if key != "locator" and value is not None}
+        changes.append(
+            {
+                "type": "add_fact",
+                "clinical_time": {"precision": "undated"},
+                "evidence": {
+                    "type": "sourced_self_report",
+                    "source_id": source_id,
+                    "source_region": {"locator": condition["locator"]},
+                    "reporter": reporter,
+                },
+                "fact": {"type": "condition_assertion", **fact},
+            }
+        )
+    return {
+        "schema_version": 1,
+        "workspace_id": init["workspace_id"],
+        "subject_id": init["subject_id"],
+        "expected_revision": init["record_revision"],
+        "idempotency_key": "private-current-conditions-v1",
+        "evidence_origin": {
+            "type": "parsed_self_report",
+            "source_id": source_id,
+            "reporter": reporter,
+        },
+        "extractor": {"name": "health-engine-current-conditions", "version": "1.0.0"},
+        "extraction_run": {
+            "source_id": source_id,
+            "coverage": {
+                "regions": [{"locator": locator} for locator in regions],
+                "domains": ["conditions"],
+            },
+            "omissions": [],
+            "failures": [],
+            "resulting_candidate_keys": regions,
+        },
+        "changes": changes,
+    }
+
+
+def validate_fact(fact: dict[str, Any], source_id: str, expected: dict[str, Any]) -> None:
+    if fact.get("original_assurance") != "explicit_self_report":
+        raise ReplayError("condition_assurance_mismatch")
+    if fact.get("clinical_time") != {"precision": "undated"}:
+        raise ReplayError("condition_time_mismatch")
+    evidence = fact.get("evidence", {})
+    if evidence.get("type") != "sourced_self_report" or evidence.get("source_id") != source_id:
+        raise ReplayError("condition_evidence_mismatch")
+    if evidence.get("source_region", {}).get("locator") != expected["locator"]:
+        raise ReplayError("condition_provenance_mismatch")
+    actual = fact.get("fact", {})
+    expected_fact = {key: value for key, value in expected.items() if key != "locator" and value is not None}
+    expected_fact = {"type": "condition_assertion", **expected_fact}
+    for field in (
+        "type",
+        "state",
+        "name",
+        "normalized_identity",
+        "body_site",
+        "assertion_text",
+    ):
+        if actual.get(field) != expected_fact.get(field):
+            raise ReplayError(f"condition_{field}_mismatch")
+
+
+def replay(config: dict[str, str]) -> None:
+    repository = Path(__file__).resolve().parent.parent
+    private_root = (repository / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    binary = Path(config["binary"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ReplayError("run_outside_private_root")
+    replay_name = config.get("replay_name", "conditions-replay-v1")
+    prefix = "conditions-replay-v"
+    if not replay_name.startswith(prefix) or not replay_name[len(prefix):].isdigit():
+        raise ReplayError("unsafe_replay_name")
+    source_path = "reports/current/health-summary.md"
+    inventory = read_json_lines(run_root / "private" / "manifests" / "inventory.jsonl")
+    if not any(item.get("path") == source_path and item.get("role") == "derived_oracle" for item in inventory):
+        raise ReplayError("condition_source_missing")
+    source = run_root / "sealed" / "tree" / source_path
+    conditions = parse_conditions(source)
+
+    replay_root = run_root / "private" / replay_name
+    replay_root.mkdir(mode=0o700)
+    logs = replay_root / "logs"
+    logs.mkdir(mode=0o700)
+    target = replay_root / "migration" / "current-conditions.md"
+    target.parent.mkdir(mode=0o700)
+    shutil.copy2(source, target)
+    target.chmod(0o600)
+    init = run_cli(
+        binary,
+        replay_root,
+        ["workspace", "init"],
+        {"schema_version": 1, "subject_id": "migration-subject"},
+        logs / "init.log",
+    )
+    registered = run_cli(
+        binary,
+        replay_root,
+        ["source", "register"],
+        {"schema_version": 1, "alias": "migration/current-conditions.md", "media_type": "text/markdown"},
+        logs / "register.log",
+    )
+    source_id = registered["source_id"]
+    changes = build_change_set(init, source_id, conditions)
+    proposed = run_cli(binary, replay_root, ["record", "propose"], changes, logs / "propose.log")
+    apply_request = {"schema_version": 1, "proposal_id": proposed["proposal_id"], "change_set": changes}
+    receipt = run_cli(binary, replay_root, ["record", "apply"], apply_request, logs / "apply.log")
+    if receipt != run_cli(binary, replay_root, ["record", "apply"], apply_request, logs / "retry.log"):
+        raise ReplayError("condition_idempotency_mismatch")
+    queried = run_cli(
+        binary,
+        replay_root,
+        ["record", "query"],
+        {"schema_version": 1, "query": {"kind": "condition_assertion", "include_history": False}},
+        logs / "query.log",
+    )
+    facts = queried.get("facts", [])
+    by_identity = {fact.get("fact", {}).get("normalized_identity"): fact for fact in facts}
+    if len(by_identity) != len(conditions):
+        raise ReplayError("condition_fact_count_mismatch")
+    for condition in conditions:
+        fact = by_identity.get(condition["normalized_identity"])
+        if fact is None:
+            raise ReplayError("condition_fact_missing")
+        validate_fact(fact, source_id, condition)
+    analysis = run_cli(
+        binary,
+        replay_root,
+        ["analysis", "run"],
+        {"schema_version": 1, "options": {"include_unverified": True}},
+        logs / "analysis.log",
+    )
+    analyzed = {
+        fact_id for claim in analysis.get("claims", []) for fact_id in claim.get("evidence_fact_ids", [])
+    }
+    if {fact["id"] for fact in facts} - analyzed:
+        raise ReplayError("condition_analysis_incomplete")
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        replay(json.load(sys.stdin))
+        print('{"status":"verified"}')
+        return 0
+    except ReplayError as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError):
+        print('{"error":"private_condition_replay_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

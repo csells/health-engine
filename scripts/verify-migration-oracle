@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Verify a private migration oracle without disclosing its contents."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+from typing import Any
+
+
+SAFE_ERROR_CODES = {
+    "empty_source",
+    "incomplete_capabilities",
+    "incomplete_claim_ledger",
+    "incomplete_inventory",
+    "incomplete_reference_baseline",
+    "invalid_capability",
+    "invalid_claim",
+    "invalid_reference_baseline",
+    "manifest_mismatch",
+    "private_file_tracked",
+    "private_permissions",
+    "private_symlink",
+    "run_not_ignored",
+    "run_outside_private_root",
+    "sealed_permissions",
+}
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def verify_permissions(run_root: Path) -> None:
+    if stat.S_IMODE(run_root.stat().st_mode) != 0o700:
+        raise ValueError("private_permissions")
+    private_root = run_root / "private"
+    for path in [private_root, *private_root.rglob("*")]:
+        if path.is_symlink():
+            raise ValueError("private_symlink")
+        expected = 0o700 if path.is_dir() else 0o600
+        if stat.S_IMODE(path.stat().st_mode) != expected:
+            raise ValueError("private_permissions")
+    sealed_tree = run_root / "sealed" / "tree"
+    for path in [sealed_tree, *sealed_tree.rglob("*")]:
+        if path.is_symlink():
+            continue
+        mode = stat.S_IMODE(path.stat().st_mode)
+        if path.is_dir() and mode != 0o500:
+            raise ValueError("sealed_permissions")
+        if path.is_file() and mode not in {0o400, 0o500}:
+            raise ValueError("sealed_permissions")
+
+
+def verify(config: dict[str, str]) -> int:
+    repository_root = Path(__file__).resolve().parent.parent
+    private_root = (repository_root / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ValueError("run_outside_private_root")
+
+    relative_run = run_root.relative_to(repository_root)
+    ignored = subprocess.run(
+        ["git", "check-ignore", "-q", "--", relative_run.as_posix()],
+        cwd=repository_root,
+        check=False,
+        capture_output=True,
+    )
+    if ignored.returncode != 0:
+        raise ValueError("run_not_ignored")
+    tracked = subprocess.run(
+        ["git", "ls-files", "--", relative_run.as_posix()],
+        cwd=repository_root,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    if tracked.stdout:
+        raise ValueError("private_file_tracked")
+
+    manifests_root = run_root / "private" / "manifests"
+    original_before = read_json_lines(manifests_root / "original-before.jsonl")
+    if not original_before:
+        raise ValueError("empty_source")
+    for manifest_name in (
+        "original-after.jsonl",
+        "sealed-copy.jsonl",
+        "workspace.jsonl",
+    ):
+        if read_json_lines(manifests_root / manifest_name) != original_before:
+            raise ValueError("manifest_mismatch")
+
+    inventory = read_json_lines(manifests_root / "inventory.jsonl")
+    if len(inventory) != len(original_before) or any(
+        not item.get("role")
+        or not item.get("owner")
+        or item.get("disposition") in {None, "unclassified"}
+        for item in inventory
+    ):
+        raise ValueError("incomplete_inventory")
+
+    claims = read_json_lines(run_root / "private" / "claims.jsonl")
+    claim_sources = {claim["source_path"] for claim in claims}
+    derived_sources = {
+        item["path"] for item in inventory if item["role"] == "derived_oracle"
+    }
+    if not derived_sources or not derived_sources.issubset(claim_sources):
+        raise ValueError("incomplete_claim_ledger")
+    if any(
+        not claim.get("id")
+        or not claim.get("normalized_meaning")
+        or not claim.get("location")
+        or claim.get("disposition") != "expected_output"
+        for claim in claims
+    ):
+        raise ValueError("invalid_claim")
+
+    reference_sources = {
+        item["path"] for item in inventory if item["role"] == "reference_resource"
+    }
+    reference_baseline = read_json_lines(
+        run_root / "private" / "reference-baseline.jsonl"
+    )
+    if {item["source_path"] for item in reference_baseline} != reference_sources:
+        raise ValueError("incomplete_reference_baseline")
+    if any(
+        len(item.get("sha256", "")) != 64
+        or "version" not in item
+        or "provenance_evidence" not in item
+        or "license_evidence" not in item
+        for item in reference_baseline
+    ):
+        raise ValueError("invalid_reference_baseline")
+
+    with (run_root / "private" / "capabilities.json").open(encoding="utf-8") as stream:
+        capability_document = json.load(stream)
+    capabilities = capability_document.get("capabilities", [])
+    inventory_paths = {item["path"] for item in inventory}
+    if capability_document.get("schema_version") != 1 or not capabilities:
+        raise ValueError("incomplete_capabilities")
+    if any(
+        capability.get("disposition") != "pending_replacement"
+        or capability.get("owner") != "migration"
+        or not capability.get("evidence_paths")
+        or not set(capability["evidence_paths"]).issubset(inventory_paths)
+        for capability in capabilities
+    ):
+        raise ValueError("invalid_capability")
+
+    verify_permissions(run_root)
+    print('{"status":"verified"}')
+    return 0
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        return verify(json.load(sys.stdin))
+    except ValueError as error:
+        code = str(error)
+        if code in SAFE_ERROR_CODES:
+            print(json.dumps({"error": code}, separators=(",", ":")), file=sys.stderr)
+            return 1
+        print('{"error":"migration_oracle_verification_failed"}', file=sys.stderr)
+        return 1
+    except Exception:
+        print('{"error":"migration_oracle_verification_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""Replay private Subject Preference candidates without promoting derived claims."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from typing import Any
+
+
+class ReplayError(Exception):
+    pass
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def run_cli(
+    binary: Path,
+    workspace: Path,
+    arguments: list[str],
+    payload: dict[str, Any],
+    log: Path,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(binary), "--workspace", str(workspace), "--json", *arguments],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        log.write_text(process.stderr, encoding="utf-8")
+        log.chmod(0o600)
+        raise ReplayError("cli_failed")
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("invalid_cli_output") from error
+
+
+def cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def table_separator(line: str) -> bool:
+    values = cells(line)
+    return bool(values) and all(
+        len(value.strip(":").strip()) >= 3
+        and set(value.strip(":").strip()) == {"-"}
+        for value in values
+    )
+
+
+def contains_monitoring_desire(value: str) -> bool:
+    words = [word for word in re.split(r"[^a-z]+", value.lower()) if word]
+    return any(
+        word.startswith("monitor")
+        and any(later.startswith("want") for later in words[position + 1:])
+        for position, word in enumerate(words)
+    )
+
+
+def has_preference_candidate(document: Path) -> bool:
+    lines = document.read_text(encoding="utf-8").splitlines()
+    detail_column = None
+    for index, raw in enumerate(lines):
+        stripped = raw.strip()
+        if not stripped.startswith("|"):
+            detail_column = None
+            continue
+        if index + 1 < len(lines) and table_separator(lines[index + 1].strip()):
+            headers = [re.sub(r"[^a-z]+", "", value.lower()) for value in cells(stripped)]
+            detail_column = (
+                headers.index("detail")
+                if "item" in headers and "detail" in headers
+                else None
+            )
+            continue
+        if table_separator(stripped) or detail_column is None:
+            continue
+        row = cells(stripped)
+        if detail_column < len(row) and contains_monitoring_desire(row[detail_column]):
+            return True
+    return False
+
+
+def locate_preference_source(
+    inventory: list[dict[str, Any]], sealed_tree: Path
+) -> tuple[str, Path]:
+    matches = []
+    for item in inventory:
+        source_path = item.get("path")
+        if (
+            item.get("role") != "derived_oracle"
+            or not isinstance(source_path, str)
+            or Path(source_path).suffix.lower() != ".md"
+        ):
+            continue
+        document = sealed_tree / source_path
+        if has_preference_candidate(document):
+            matches.append((source_path, document))
+    if len(matches) != 1:
+        raise ReplayError("preference_source_ambiguous")
+    return matches[0]
+
+
+def validate_candidate_projection(workspace: Path, source_id: str) -> None:
+    database = workspace / ".health-engine" / "health.sqlite3"
+    with sqlite3.connect(database) as connection:
+        runs = connection.execute(
+            "SELECT id FROM extraction_runs WHERE source_id = ? ",
+            (source_id,),
+        ).fetchall()
+        if len(runs) != 1:
+            raise ReplayError("preference_extraction_run_mismatch")
+        run_id = runs[0][0]
+        domains = connection.execute(
+            "SELECT domain FROM extraction_run_domains "
+            "WHERE extraction_run_id = ? ORDER BY position",
+            (run_id,),
+        ).fetchall()
+        if domains != [("subject_preferences",)]:
+            raise ReplayError("preference_domain_mismatch")
+        regions = connection.execute(
+            "SELECT locator FROM extraction_run_regions "
+            "WHERE extraction_run_id = ? ORDER BY position",
+            (run_id,),
+        ).fetchall()
+        candidates = connection.execute(
+            "SELECT candidate_key FROM extraction_run_candidates "
+            "WHERE extraction_run_id = ? ORDER BY position",
+            (run_id,),
+        ).fetchall()
+        issues = connection.execute(
+            "SELECT code, region_locator FROM extraction_run_issues "
+            "WHERE extraction_run_id = ? AND issue_kind = 'failure' ORDER BY position",
+            (run_id,),
+        ).fetchall()
+        if not candidates:
+            raise ReplayError("preference_candidate_missing")
+        if candidates != regions:
+            raise ReplayError("preference_candidate_provenance_mismatch")
+        if [region for _, region in issues] != [candidate for (candidate,) in candidates]:
+            raise ReplayError("preference_candidate_issue_mismatch")
+        if any(code != "subject_confirmation_required" for code, _ in issues):
+            raise ReplayError("preference_candidate_reason_mismatch")
+        fact_count = connection.execute(
+            "SELECT COUNT(*) FROM facts WHERE fact_type = 'subject_preference'"
+        ).fetchone()
+        if fact_count != (0,):
+            raise ReplayError("preference_candidate_was_promoted")
+
+
+def replay(config: dict[str, str]) -> None:
+    repository = Path(__file__).resolve().parent.parent
+    private_root = (repository / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    binary = Path(config["binary"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ReplayError("run_outside_private_root")
+    replay_name = config.get("replay_name", "subject-preferences-replay-v1")
+    prefix = "subject-preferences-replay-v"
+    if not replay_name.startswith(prefix) or not replay_name[len(prefix):].isdigit():
+        raise ReplayError("unsafe_replay_name")
+
+    inventory = read_json_lines(run_root / "private" / "manifests" / "inventory.jsonl")
+    _, source = locate_preference_source(inventory, run_root / "sealed" / "tree")
+    replay_root = run_root / "private" / replay_name
+    replay_root.mkdir(mode=0o700)
+    logs = replay_root / "logs"
+    logs.mkdir(mode=0o700)
+    target = replay_root / "migration" / "subject-preferences.md"
+    target.parent.mkdir(mode=0o700)
+    shutil.copy2(source, target)
+    target.chmod(0o600)
+
+    init = run_cli(
+        binary,
+        replay_root,
+        ["workspace", "init"],
+        {"schema_version": 1, "subject_id": "migration-subject"},
+        logs / "init.log",
+    )
+    registered = run_cli(
+        binary,
+        replay_root,
+        ["source", "register"],
+        {
+            "schema_version": 1,
+            "alias": "migration/subject-preferences.md",
+            "media_type": "text/markdown",
+        },
+        logs / "register.log",
+    )
+    source_id = registered["source_id"]
+    request = {
+        "schema_version": 1,
+        "workspace_id": init["workspace_id"],
+        "subject_id": init["subject_id"],
+        "expected_revision": init["record_revision"],
+        "idempotency_key": "private-subject-preference-candidates-v1",
+        "source_id": source_id,
+        "extractor": {
+            "name": "health-engine-subject-preference-migration",
+            "version": "1.0.0",
+        },
+    }
+    receipt = run_cli(
+        binary,
+        replay_root,
+        ["record", "import-subject-preferences"],
+        request,
+        logs / "import.log",
+    )
+    retry = run_cli(
+        binary,
+        replay_root,
+        ["record", "import-subject-preferences"],
+        request,
+        logs / "retry.log",
+    )
+    if receipt != retry:
+        raise ReplayError("preference_idempotency_mismatch")
+    if receipt.get("accepted_fact_ids") or receipt.get("already_present_fact_ids"):
+        raise ReplayError("preference_candidate_was_promoted")
+    queried = run_cli(
+        binary,
+        replay_root,
+        ["record", "query"],
+        {
+            "schema_version": 1,
+            "query": {"kind": "subject_preference", "include_history": True},
+        },
+        logs / "query.log",
+    )
+    if queried.get("facts"):
+        raise ReplayError("preference_candidate_was_promoted")
+    validate_candidate_projection(replay_root, source_id)
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        replay(json.load(sys.stdin))
+        print('{"status":"verified"}')
+        return 0
+    except ReplayError as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError, IndexError, sqlite3.Error):
+        print('{"error":"private_subject_preference_replay_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

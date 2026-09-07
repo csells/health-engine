@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Create a protected, read-only migration oracle without printing private data."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import sys
+from typing import Any
+
+
+class OracleError(Exception):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def validate_source_tree(root: Path) -> None:
+    for path in root.rglob("*"):
+        if not path.is_symlink():
+            continue
+        resolved_target = (path.parent / os.readlink(path)).resolve()
+        if resolved_target != root and root not in resolved_target.parents:
+            raise OracleError("unsafe_source_tree")
+
+
+def file_manifest(root: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root)
+        if ".git" in relative.parts:
+            continue
+        if path.is_symlink():
+            rows.append(
+                {
+                    "path": relative.as_posix(),
+                    "kind": "symlink",
+                    "target": os.readlink(path),
+                }
+            )
+            continue
+        if not path.is_file():
+            continue
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        rows.append(
+            {
+                "path": relative.as_posix(),
+                "kind": "file",
+                "bytes": path.stat().st_size,
+                "sha256": digest,
+            }
+        )
+    return rows
+
+
+def role_for(path: str, kind: str) -> str:
+    parts = Path(path).parts
+    if kind == "symlink" and parts[:2] in ((".agents", "skills"), (".gemini", "skills")):
+        return "skill_alias"
+    if parts[0] == "test-results" or path == "data/genome.txt":
+        return "source"
+    if path == "reports/current/lab-timeline.csv":
+        return "machine_readable_source"
+    if parts[0] == "reports":
+        return "derived_oracle"
+    if parts[:2] == (".claude", "skills"):
+        return "skill"
+    if parts[0] == "scripts":
+        return "code"
+    if parts[0] == "data" and Path(path).suffix == ".csv":
+        return "machine_readable_source"
+    if parts[0] == "data":
+        return "reference_resource"
+    return "unsupported_artifact"
+
+
+def disposition_for(role: str) -> str:
+    return {
+        "source": "pending_ingestion",
+        "machine_readable_source": "pending_reconciliation",
+        "reference_resource": "legacy_baseline",
+        "derived_oracle": "oracle_only",
+        "skill": "capability_input",
+        "skill_alias": "capability_input",
+        "code": "capability_input",
+        "unsupported_artifact": "quarantined",
+    }[role]
+
+
+def write_json_lines(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")))
+            stream.write("\n")
+
+
+def restrict_permissions(root: Path) -> None:
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o700)
+        elif path.is_file():
+            source_mode = path.stat().st_mode
+            path.chmod(0o700 if source_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH) else 0o600)
+    root.chmod(0o700)
+
+
+def seal_tree(root: Path) -> None:
+    paths = list(root.rglob("*"))
+    for path in paths:
+        if path.is_symlink():
+            continue
+        if path.is_dir():
+            path.chmod(0o500)
+        elif path.is_file():
+            source_mode = path.stat().st_mode
+            path.chmod(0o500 if source_mode & stat.S_IXUSR else 0o400)
+    root.chmod(0o500)
+
+
+def prepare(config: dict[str, str]) -> int:
+    repository_root = Path(__file__).resolve().parent.parent
+    private_root = (repository_root / "tmp").resolve()
+    source_root = Path(config["source_root"]).resolve(strict=True)
+    destination_root = Path(config["destination_root"]).resolve()
+
+    if destination_root == private_root or private_root not in destination_root.parents:
+        raise ValueError("destination_outside_private_root")
+    if destination_root.exists():
+        raise FileExistsError("destination_exists")
+    validate_source_tree(source_root)
+
+    os.umask(0o077)
+    destination_root.mkdir(parents=True, mode=0o700)
+    private_artifacts = destination_root / "private"
+    manifests_root = private_artifacts / "manifests"
+    logs_root = private_artifacts / "logs"
+    temp_root = private_artifacts / "temp"
+    for directory in (private_artifacts, manifests_root, logs_root, temp_root):
+        directory.mkdir(mode=0o700)
+    for directory in (
+        destination_root / "reference-cache",
+        destination_root / "reference-cache" / "legacy",
+        destination_root / "reference-cache" / "current",
+    ):
+        directory.mkdir(mode=0o700)
+
+    before = file_manifest(source_root)
+    write_json_lines(manifests_root / "original-before.jsonl", before)
+
+    sealed_root = destination_root / "sealed"
+    sealed_root.mkdir(mode=0o700)
+    sealed_tree = sealed_root / "tree"
+    shutil.copytree(
+        source_root,
+        sealed_tree,
+        symlinks=True,
+        ignore=shutil.ignore_patterns(".git"),
+    )
+    restrict_permissions(sealed_tree)
+
+    workspace = destination_root / "workspace"
+    legacy_oracle = destination_root / "legacy-oracle"
+    shutil.copytree(sealed_tree, workspace, symlinks=True)
+    shutil.copytree(sealed_tree, legacy_oracle, symlinks=True)
+    restrict_permissions(workspace)
+    restrict_permissions(legacy_oracle)
+
+    after = file_manifest(source_root)
+    write_json_lines(manifests_root / "original-after.jsonl", after)
+    write_json_lines(manifests_root / "sealed-copy.jsonl", file_manifest(sealed_tree))
+    write_json_lines(manifests_root / "workspace.jsonl", file_manifest(workspace))
+    inventory = []
+    for row in before:
+        role = role_for(row["path"], row["kind"])
+        inventory.append(
+            {
+                "path": row["path"],
+                "kind": row["kind"],
+                "role": role,
+                "disposition": disposition_for(role),
+                "owner": "migration",
+                **({"target": row["target"]} if row["kind"] == "symlink" else {}),
+            }
+        )
+    write_json_lines(manifests_root / "inventory.jsonl", inventory)
+    restrict_permissions(private_artifacts)
+    restrict_permissions(destination_root / "reference-cache")
+    seal_tree(sealed_tree)
+    sealed_root.chmod(0o500)
+    destination_root.chmod(0o700)
+
+    if before != after:
+        raise RuntimeError("original_changed")
+
+    print('{"status":"ready"}')
+    return 0
+
+
+def main() -> int:
+    try:
+        config = json.load(sys.stdin)
+        return prepare(config)
+    except OracleError as error:
+        print(json.dumps({"error": error.code}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except Exception:
+        print('{"error":"migration_oracle_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

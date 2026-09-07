@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Replay private vital timelines through public CLI seams without disclosure."""
+
+from __future__ import annotations
+
+import csv
+from decimal import Decimal, InvalidOperation
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+FORMATS = {
+    ("date", "systolic", "diastolic", "pulse", "measured_by", "note"):
+        "blood_pressure_pulse",
+    ("date", "weight_lbs", "note"): "weight",
+}
+
+
+class ReplayError(Exception):
+    pass
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def run_cli(
+    binary: Path,
+    workspace: Path,
+    arguments: list[str],
+    payload: dict[str, Any],
+    log: Path,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(binary), "--workspace", str(workspace), "--json", *arguments],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        log.write_text(process.stderr, encoding="utf-8")
+        log.chmod(0o600)
+        raise ReplayError("cli_failed")
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("invalid_cli_output") from error
+
+
+def locate_sources(
+    tree: Path, inventory: list[dict[str, Any]]
+) -> dict[str, tuple[Path, list[dict[str, str]]]]:
+    found: dict[str, tuple[Path, list[dict[str, str]]]] = {}
+    for item in inventory:
+        if item.get("role") != "machine_readable_source":
+            continue
+        path = tree / item["path"]
+        if path.suffix.lower() != ".csv":
+            continue
+        try:
+            with path.open(encoding="utf-8", newline="") as stream:
+                reader = csv.DictReader(stream)
+                format_name = FORMATS.get(tuple(reader.fieldnames or ()))
+                if format_name:
+                    if format_name in found:
+                        raise ReplayError("vital_source_not_unique")
+                    found[format_name] = (path, list(reader))
+        except (OSError, UnicodeError, csv.Error) as error:
+            raise ReplayError("vital_source_invalid") from error
+    if set(found) != set(FORMATS.values()) or any(not rows for _, rows in found.values()):
+        raise ReplayError("vital_source_incomplete")
+    return found
+
+
+def decimal_equal(left: Any, right: str) -> bool:
+    try:
+        return Decimal(str(left)) == Decimal(right)
+    except InvalidOperation:
+        return False
+
+
+def validate_common(
+    fact: dict[str, Any], source_id: str, row_number: int, source_date: str
+) -> dict[str, Any]:
+    if fact.get("original_assurance") != "explicit_self_report":
+        raise ReplayError("assurance_mismatch")
+    evidence = fact.get("evidence", {})
+    if evidence.get("type") != "sourced_self_report":
+        raise ReplayError("evidence_mismatch")
+    if evidence.get("source_id") != source_id:
+        raise ReplayError("provenance_mismatch")
+    if evidence.get("source_region", {}).get("locator") != f"row:{row_number}":
+        raise ReplayError("provenance_mismatch")
+    if fact.get("clinical_time") != {"precision": "date", "value": source_date}:
+        raise ReplayError("clinical_time_mismatch")
+    value = fact.get("fact", {})
+    if value.get("type") != "vital_measurement":
+        raise ReplayError("fact_type_mismatch")
+    return value
+
+
+def verify_blood_pressure(
+    rows: list[dict[str, str]], facts: list[dict[str, Any]], source_id: str
+) -> None:
+    by_key = {
+        (fact["evidence"]["source_region"]["locator"],
+         fact["fact"]["measurement_type"]): fact
+        for fact in facts if fact.get("evidence", {}).get("source_id") == source_id
+    }
+    expected_facts = len(rows) + sum(bool(row["pulse"]) for row in rows)
+    if len(by_key) != expected_facts:
+        raise ReplayError("fact_count_mismatch")
+    for row_number, row in enumerate(rows, 2):
+        pressure = by_key.get((f"row:{row_number}", "blood_pressure"))
+        pulse = by_key.get((f"row:{row_number}", "pulse"))
+        if pressure is None or bool(pulse) != bool(row["pulse"]):
+            raise ReplayError("fact_mismatch")
+        pressure_value = validate_common(pressure, source_id, row_number, row["date"])
+        if pressure_value.get("original_systolic") != row["systolic"]:
+            raise ReplayError("value_mismatch")
+        if pressure_value.get("original_diastolic") != row["diastolic"]:
+            raise ReplayError("value_mismatch")
+        if not decimal_equal(pressure_value.get("systolic"), row["systolic"]):
+            raise ReplayError("value_mismatch")
+        if not decimal_equal(pressure_value.get("diastolic"), row["diastolic"]):
+            raise ReplayError("value_mismatch")
+        values = [pressure_value]
+        if pulse is not None:
+            pulse_value = validate_common(pulse, source_id, row_number, row["date"])
+            if pulse_value.get("original") != row["pulse"]:
+                raise ReplayError("value_mismatch")
+            if not decimal_equal(pulse_value.get("value"), row["pulse"]):
+                raise ReplayError("value_mismatch")
+            values.append(pulse_value)
+        for value in values:
+            if value.get("measured_by") != (row["measured_by"] or None):
+                raise ReplayError("context_mismatch")
+            if value.get("note") != (row["note"] or None):
+                raise ReplayError("context_mismatch")
+
+
+def verify_weight(
+    rows: list[dict[str, str]], facts: list[dict[str, Any]], source_id: str
+) -> None:
+    selected = [fact for fact in facts if fact.get("evidence", {}).get("source_id") == source_id]
+    by_region = {fact["evidence"]["source_region"]["locator"]: fact for fact in selected}
+    if len(by_region) != len(rows):
+        raise ReplayError("fact_count_mismatch")
+    for row_number, row in enumerate(rows, 2):
+        fact = by_region.get(f"row:{row_number}")
+        if fact is None:
+            raise ReplayError("fact_mismatch")
+        value = validate_common(fact, source_id, row_number, row["date"])
+        if value.get("measurement_type") != "weight":
+            raise ReplayError("fact_type_mismatch")
+        if value.get("original") != row["weight_lbs"]:
+            raise ReplayError("value_mismatch")
+        if not decimal_equal(value.get("value"), row["weight_lbs"]):
+            raise ReplayError("value_mismatch")
+        if value.get("units") != "lb" or value.get("note") != (row["note"] or None):
+            raise ReplayError("context_mismatch")
+
+
+def replay(config: dict[str, str]) -> None:
+    repository = Path(__file__).resolve().parent.parent
+    private_root = (repository / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    binary = Path(config["binary"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ReplayError("run_outside_private_root")
+    replay_name = config.get("replay_name", "vitals-replay-v1")
+    prefix = "vitals-replay-v"
+    if not replay_name.startswith(prefix) or not replay_name[len(prefix):].isdigit():
+        raise ReplayError("unsafe_replay_name")
+    replay_root = run_root / "private" / replay_name
+    replay_root.mkdir(mode=0o700)
+    logs = replay_root / "logs"
+    logs.mkdir(mode=0o700)
+    inventory = read_json_lines(run_root / "private" / "manifests" / "inventory.jsonl")
+    sources = locate_sources(run_root / "sealed" / "tree", inventory)
+    aliases = {
+        "blood_pressure_pulse": "migration/blood-pressure.csv",
+        "weight": "migration/weight.csv",
+    }
+    for format_name, (source, _) in sources.items():
+        target = replay_root / aliases[format_name]
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        shutil.copy2(source, target)
+        target.chmod(0o600)
+    init = run_cli(
+        binary, replay_root, ["workspace", "init"],
+        {"schema_version": 1, "subject_id": "migration-subject"},
+        logs / "init.log",
+    )
+    revision = init["record_revision"]
+    source_ids: dict[str, str] = {}
+    receipts: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for format_name in ("blood_pressure_pulse", "weight"):
+        registered = run_cli(
+            binary, replay_root, ["source", "register"],
+            {"schema_version": 1, "alias": aliases[format_name], "media_type": "text/csv"},
+            logs / f"register-{format_name}.log",
+        )
+        source_ids[format_name] = registered["source_id"]
+        request = {
+            "schema_version": 1,
+            "workspace_id": init["workspace_id"],
+            "subject_id": init["subject_id"],
+            "expected_revision": revision,
+            "idempotency_key": f"private-vitals-{format_name}-v1",
+            "source_id": registered["source_id"],
+            "reporter": {"kind": "subject", "identifier": "migration-subject"},
+            "extractor": {"name": "health-engine-vital-timeline", "version": "1.0.0"},
+            "format": format_name,
+        }
+        receipt = run_cli(
+            binary, replay_root, ["record", "import-vital-timeline"], request,
+            logs / f"import-{format_name}.log",
+        )
+        revision = receipt["record_revision"]
+        receipts.append((request, receipt))
+    for request, receipt in receipts:
+        retried = run_cli(
+            binary, replay_root, ["record", "import-vital-timeline"], request,
+            logs / "retry.log",
+        )
+        if retried != receipt:
+            raise ReplayError("idempotency_mismatch")
+    queried = run_cli(
+        binary, replay_root, ["record", "query"],
+        {"schema_version": 1,
+         "query": {"kind": "vital_measurement", "include_history": False}},
+        logs / "query.log",
+    )
+    facts = queried["facts"]
+    verify_blood_pressure(sources["blood_pressure_pulse"][1], facts,
+                          source_ids["blood_pressure_pulse"])
+    verify_weight(sources["weight"][1], facts, source_ids["weight"])
+    analysis = run_cli(
+        binary, replay_root, ["analysis", "run"],
+        {"schema_version": 1, "options": {"include_unverified": True}},
+        logs / "analysis.log",
+    )
+    fact_ids = {fact["id"] for fact in facts}
+    if any(not set(claim["evidence_fact_ids"]).issubset(fact_ids)
+           for claim in analysis["claims"]):
+        raise ReplayError("analysis_provenance_mismatch")
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        replay(json.load(sys.stdin))
+        print('{"status":"verified"}')
+        return 0
+    except ReplayError as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError, csv.Error):
+        print('{"error":"private_vitals_replay_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

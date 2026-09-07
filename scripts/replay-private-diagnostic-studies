@@ -1,0 +1,481 @@
+#!/usr/bin/env python3
+"""Replay private Diagnostic Studies with bound Source Verification."""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+NUMBERED_SECTION = re.compile(r"^\s*(\d+)\.\s+(.+?):\s*$")
+UPPER_SECTION = re.compile(r"^\s*([A-Z][A-Z ]+):\s*(.*)$")
+
+
+class ReplayError(Exception):
+    pass
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def run_cli(
+    binary: Path,
+    workspace: Path,
+    arguments: list[str],
+    payload: dict[str, Any],
+    log: Path,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(binary), "--workspace", str(workspace), "--json", *arguments],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        log.write_text(process.stderr, encoding="utf-8")
+        log.chmod(0o600)
+        raise ReplayError("cli_failed")
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("invalid_cli_output") from error
+
+
+def pdf_text(path: Path) -> str:
+    process = subprocess.run(
+        ["pdftotext", "-layout", str(path), "-"],
+        capture_output=True,
+        text=True,
+        errors="ignore",
+        check=False,
+    )
+    if process.returncode != 0:
+        raise ReplayError("diagnostic_pdf_extract_failed")
+    return process.stdout
+
+
+def pdf_pages(path: Path) -> int:
+    process = subprocess.run(["pdfinfo", str(path)], capture_output=True, text=True, check=False)
+    match = re.search(r"^Pages:\s+(\d+)\s*$", process.stdout, re.MULTILINE)
+    if process.returncode != 0 or not match:
+        raise ReplayError("diagnostic_pdf_info_failed")
+    return int(match.group(1))
+
+
+def classify(text: str) -> str | None:
+    lower = text.lower()
+    if "final pathologic diagnosis" in lower and "materials received" in lower:
+        return "pathology"
+    if "findings:" in lower and "impression:" in lower and "mri" in lower:
+        return "imaging"
+    return None
+
+
+def iso_date(value: str, formats: tuple[str, ...]) -> str:
+    for format_string in formats:
+        try:
+            return datetime.strptime(value.strip(), format_string).date().isoformat()
+        except ValueError:
+            continue
+    raise ReplayError("diagnostic_date_invalid")
+
+
+def first_match(pattern: str, text: str, code: str, flags: int = 0) -> str:
+    match = re.search(pattern, text, flags)
+    if not match:
+        raise ReplayError(code)
+    return " ".join(match.group(1).split())
+
+
+def lines_between(lines: list[str], start_label: str, end_labels: tuple[str, ...]) -> list[str]:
+    start = next((index for index, line in enumerate(lines) if line.strip() == start_label), None)
+    if start is None:
+        raise ReplayError("diagnostic_section_missing")
+    selected = []
+    for line in lines[start + 1:]:
+        if line.strip() in end_labels:
+            break
+        selected.append(line)
+    return selected
+
+
+def parse_pathology(path: Path, source_path: str, text: str) -> dict[str, Any]:
+    lines = text.splitlines()
+    name = next((" ".join(line.split()) for line in lines if "PATHOLOGY" in line.upper()), None)
+    if not name:
+        raise ReplayError("pathology_name_missing")
+    collected = first_match(
+        r"Collected on\s+([A-Z][a-z]{2}\s+\d{2},\s+\d{4})", text, "pathology_collection_missing"
+    )
+    result_date = first_match(
+        r"Result date:\s*([A-Z][a-z]{2}\s+\d{2},\s+\d{4})", text, "pathology_result_date_missing"
+    )
+    diagnosis_lines = lines_between(lines, "Final Pathologic Diagnosis", ("Comment:",))
+    findings: list[dict[str, Any]] = []
+    section: str | None = None
+    fragments: list[str] = []
+
+    def finish() -> None:
+        nonlocal section, fragments
+        if section and fragments:
+            findings.append(
+                {
+                    "section": section,
+                    "body_site": section.split(",", 1)[0].strip(),
+                    "text": " ".join(fragment.strip(" –-") for fragment in fragments),
+                }
+            )
+        section = None
+        fragments = []
+
+    for line in diagnosis_lines:
+        if match := NUMBERED_SECTION.match(line):
+            finish()
+            section = match.group(2).strip()
+        elif section and line.strip().startswith(("–", "-")):
+            fragments.append(line.strip())
+        elif section and fragments and line.strip():
+            fragments.append(line.strip())
+    finish()
+    if not findings:
+        raise ReplayError("pathology_findings_missing")
+    ordering_provider = first_match(
+        r"Ordering provider:\s*([^\n]+)", text, "pathology_ordering_provider_missing"
+    )
+    interpreting_provider = first_match(
+        r"Case seen by:\s*\n\s*([^\n]+?)(?:\s+[–-]\s+Pathologist)?\s*$",
+        text,
+        "pathology_interpreter_missing",
+        re.MULTILINE,
+    )
+    organization = first_match(
+        r"Resulting lab:\s*\n\s*([^\n]+)", text, "pathology_organization_missing"
+    )
+    return {
+        "category": "pathology",
+        "source_path": source_path,
+        "source_region": f"pages:1-{pdf_pages(path)}",
+        "clinical_time": {
+            "precision": "date",
+            "value": iso_date(collected, ("%b %d, %Y",)),
+            "source_text": collected,
+        },
+        "fact": {
+            "type": "diagnostic_study",
+            "kind": "pathology",
+            "status": "final",
+            "name": name,
+            "body_site": findings[0]["body_site"],
+            "findings": findings,
+            "resulted_at": {
+                "precision": "date",
+                "value": iso_date(result_date, ("%b %d, %Y",)),
+            },
+            "ordering_provider": ordering_provider,
+            "interpreting_provider": interpreting_provider,
+            "performing_organization": organization,
+        },
+    }
+
+
+def parse_imaging(path: Path, source_path: str, text: str) -> dict[str, Any]:
+    lines = text.splitlines()
+    name = first_match(r"^\s*EXAM:\s*(.+?)\s*$", text, "imaging_exam_missing", re.MULTILINE)
+    technique = first_match(
+        r"TECHNIQUE:\s*(.*?)\n\s*FINDINGS:",
+        text,
+        "imaging_technique_missing",
+        re.DOTALL,
+    )
+    finding_lines = lines_between(lines, "FINDINGS:", ("IMPRESSION:",))
+    findings: list[dict[str, Any]] = []
+    section: str | None = None
+    fragments: list[str] = []
+
+    def finish() -> None:
+        nonlocal section, fragments
+        if section and fragments:
+            findings.append(
+                {"section": section, "body_site": section, "text": " ".join(fragments)}
+            )
+        section = None
+        fragments = []
+
+    for line in finding_lines:
+        if match := UPPER_SECTION.match(line):
+            finish()
+            section = match.group(1).strip()
+            if match.group(2).strip():
+                fragments.append(match.group(2).strip())
+        elif section and line.strip():
+            fragments.append(line.strip())
+    finish()
+    impression_lines = lines_between(lines, "IMPRESSION:", ())
+    impression_parts = []
+    for line in impression_lines:
+        stripped = line.strip()
+        if stripped.startswith("---") or stripped.lower().startswith("recent literature"):
+            break
+        if stripped:
+            impression_parts.append(stripped)
+    impression = " ".join(impression_parts)
+    if not technique or not findings or not impression:
+        raise ReplayError("imaging_result_incomplete")
+    path_date = re.match(r"(\d{4}-\d{2}-\d{2})_", Path(source_path).name)
+    if not path_date:
+        raise ReplayError("imaging_collection_date_missing")
+    result_date = first_match(
+        r"Final signature:.*?(\d{1,2}/\d{1,2}/\d{4})", text, "imaging_result_date_missing"
+    )
+    interpreter = first_match(
+        r"Final signature:\s*([^,\n]+),\s*MD", text, "imaging_interpreter_missing"
+    )
+    return {
+        "category": "imaging",
+        "source_path": source_path,
+        "source_region": f"pages:1-{pdf_pages(path)}",
+        "clinical_time": {
+            "precision": "date",
+            "value": path_date.group(1),
+            "source_text": path_date.group(1),
+        },
+        "fact": {
+            "type": "diagnostic_study",
+            "kind": "imaging",
+            "status": "final",
+            "name": name,
+            "body_site": findings[0]["body_site"],
+            "method": technique,
+            "findings": findings,
+            "impression": impression,
+            "resulted_at": {
+                "precision": "date",
+                "value": iso_date(result_date, ("%m/%d/%Y",)),
+            },
+            "interpreting_provider": interpreter,
+        },
+    }
+
+
+def apply_change_set(
+    binary: Path,
+    workspace: Path,
+    logs: Path,
+    change_set: dict[str, Any],
+    stage: str,
+) -> dict[str, Any]:
+    proposal = run_cli(binary, workspace, ["record", "propose"], change_set, logs / f"{stage}-propose.log")
+    request = {"schema_version": 1, "proposal_id": proposal["proposal_id"], "change_set": change_set}
+    receipt = run_cli(binary, workspace, ["record", "apply"], request, logs / f"{stage}-apply.log")
+    retry = run_cli(binary, workspace, ["record", "apply"], request, logs / f"{stage}-retry.log")
+    if receipt != retry:
+        raise ReplayError("diagnostic_idempotency_mismatch")
+    return receipt
+
+
+def extraction_change_set(
+    init: dict[str, Any], revision: int, source_id: str, study: dict[str, Any]
+) -> dict[str, Any]:
+    region = {"locator": study["source_region"]}
+    return {
+        "schema_version": 1,
+        "workspace_id": init["workspace_id"],
+        "subject_id": init["subject_id"],
+        "expected_revision": revision,
+        "idempotency_key": f"private-diagnostic-{study['category']}-v1",
+        "evidence_origin": {"type": "document_extraction", "source_id": source_id},
+        "extractor": {"name": "health-engine-diagnostic-study", "version": "1.0.0"},
+        "extraction_run": {
+            "source_id": source_id,
+            "coverage": {"regions": [region], "domains": ["diagnostic_studies"]},
+            "omissions": [],
+            "failures": [],
+            "resulting_candidate_keys": [study["source_region"]],
+        },
+        "changes": [
+            {
+                "type": "add_fact",
+                "clinical_time": study["clinical_time"],
+                "evidence": {
+                    "type": "source",
+                    "source_id": source_id,
+                    "source_region": region,
+                    "asserted_by": {"kind": "agent", "identifier": "health-engine-diagnostic-study"},
+                },
+                "fact": study["fact"],
+            }
+        ],
+    }
+
+
+def verification_change_set(
+    init: dict[str, Any], revision: int, source_id: str, fact_id: str,
+    region: str, attestation: dict[str, Any], category: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "workspace_id": init["workspace_id"],
+        "subject_id": init["subject_id"],
+        "expected_revision": revision,
+        "idempotency_key": f"private-diagnostic-{category}-verification-v1",
+        "evidence_origin": {"type": "source_verification", "source_id": source_id},
+        "extractor": {"name": attestation["reviewer"], "version": attestation["method_version"]},
+        "extraction_run": None,
+        "changes": [
+            {
+                "type": "verify_fact",
+                "fact_id": fact_id,
+                "source_id": source_id,
+                "source_region": {"locator": region},
+                "verifier": {"kind": "agent", "identifier": attestation["reviewer"]},
+                "method": {"name": attestation["method"], "version": attestation["method_version"]},
+                "checked_at": attestation["checked_at"],
+                "scope": "all_pages_findings_and_impression",
+                "outcome": "verified",
+            }
+        ],
+    }
+
+
+def validate_fact(fact: dict[str, Any], source_id: str, expected: dict[str, Any]) -> None:
+    if fact.get("original_assurance") != "unverified" or fact.get("current_assurance") != "source_verified":
+        raise ReplayError("diagnostic_assurance_mismatch")
+    evidence = fact.get("evidence", {})
+    if evidence.get("type") != "source" or evidence.get("source_id") != source_id:
+        raise ReplayError("diagnostic_evidence_mismatch")
+    if evidence.get("source_region", {}).get("locator") != expected["source_region"]:
+        raise ReplayError("diagnostic_provenance_mismatch")
+    if fact.get("clinical_time") != expected["clinical_time"]:
+        raise ReplayError("diagnostic_time_mismatch")
+    actual = fact.get("fact", {})
+    for field in (
+        "type", "kind", "status", "name", "body_site", "method", "findings", "impression",
+        "resulted_at", "ordering_provider", "interpreting_provider", "performing_organization",
+    ):
+        if actual.get(field) != expected["fact"].get(field):
+            raise ReplayError(f"diagnostic_{field}_mismatch")
+
+
+def replay(config: dict[str, str]) -> None:
+    repository = Path(__file__).resolve().parent.parent
+    private_root = (repository / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    binary = Path(config["binary"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ReplayError("run_outside_private_root")
+    replay_name = config.get("replay_name", "diagnostic-replay-v1")
+    prefix = "diagnostic-replay-v"
+    if not replay_name.startswith(prefix) or not replay_name[len(prefix):].isdigit():
+        raise ReplayError("unsafe_replay_name")
+    with (run_root / "private" / "diagnostic-source-verification.json").open() as stream:
+        attestation = json.load(stream)
+    manifest = {
+        row["path"]: row
+        for row in read_json_lines(run_root / "private" / "manifests" / "original-before.jsonl")
+    }
+    studies: list[dict[str, Any]] = []
+    attested = {study["source_path"]: study for study in attestation["studies"]}
+    for source_path, review in attested.items():
+        source = run_root / "sealed" / "tree" / source_path
+        if manifest[source_path]["sha256"] != review["sha256"] or pdf_pages(source) != review["reviewed_pages"]:
+            raise ReplayError("diagnostic_attestation_mismatch")
+        text = pdf_text(source)
+        category = classify(text)
+        if category != review["category"]:
+            raise ReplayError("diagnostic_classification_mismatch")
+        parser = parse_pathology if category == "pathology" else parse_imaging
+        studies.append(parser(source, source_path, text))
+    if sorted(study["category"] for study in studies) != ["imaging", "pathology"]:
+        raise ReplayError("diagnostic_sources_incomplete")
+
+    replay_root = run_root / "private" / replay_name
+    replay_root.mkdir(mode=0o700)
+    logs = replay_root / "logs"
+    logs.mkdir(mode=0o700)
+    init = run_cli(
+        binary, replay_root, ["workspace", "init"],
+        {"schema_version": 1, "subject_id": "migration-subject"}, logs / "init.log",
+    )
+    revision = init["record_revision"]
+    source_ids: dict[str, str] = {}
+    expected_by_category = {study["category"]: study for study in studies}
+    fact_ids: dict[str, str] = {}
+    for category in ("pathology", "imaging"):
+        study = expected_by_category[category]
+        source = run_root / "sealed" / "tree" / study["source_path"]
+        alias = f"migration/diagnostic-{category}.pdf"
+        target = replay_root / alias
+        target.parent.mkdir(mode=0o700, exist_ok=True)
+        shutil.copy2(source, target)
+        target.chmod(0o600)
+        registered = run_cli(
+            binary, replay_root, ["source", "register"],
+            {"schema_version": 1, "alias": alias, "media_type": "application/pdf"},
+            logs / f"{category}-register.log",
+        )
+        source_id = registered["source_id"]
+        source_ids[category] = source_id
+        receipt = apply_change_set(
+            binary, replay_root, logs,
+            extraction_change_set(init, revision, source_id, study), f"{category}-extract",
+        )
+        revision = receipt["record_revision"]
+        fact_ids[category] = receipt["accepted_fact_ids"][0]
+        verification = verification_change_set(
+            init, revision, source_id, fact_ids[category], study["source_region"], attestation, category
+        )
+        receipt = apply_change_set(binary, replay_root, logs, verification, f"{category}-verify")
+        revision = receipt["record_revision"]
+    queried = run_cli(
+        binary, replay_root, ["record", "query"],
+        {"schema_version": 1, "query": {"kind": "diagnostic_study", "include_history": False}},
+        logs / "query.log",
+    )
+    facts = queried.get("facts", [])
+    by_source = {fact.get("evidence", {}).get("source_id"): fact for fact in facts}
+    if len(by_source) != len(studies):
+        raise ReplayError("diagnostic_fact_count_mismatch")
+    for category, study in expected_by_category.items():
+        fact = by_source.get(source_ids[category])
+        if fact is None:
+            raise ReplayError("diagnostic_fact_missing")
+        validate_fact(fact, source_ids[category], study)
+    analysis = run_cli(
+        binary, replay_root, ["analysis", "run"],
+        {"schema_version": 1, "options": {"include_unverified": True}}, logs / "analysis.log",
+    )
+    analyzed = {
+        fact_id for claim in analysis.get("claims", []) for fact_id in claim.get("evidence_fact_ids", [])
+    }
+    if set(fact_ids.values()) - analyzed:
+        raise ReplayError("diagnostic_analysis_incomplete")
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        replay(json.load(sys.stdin))
+        print('{"status":"verified"}')
+        return 0
+    except ReplayError as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError, IndexError, json.JSONDecodeError) as error:
+        exception_name = re.sub(r"(?<!^)(?=[A-Z])", "_", type(error).__name__).lower()
+        code = f"diagnostic_internal_{exception_name}"
+        print(json.dumps({"error": code}, separators=(",", ":")), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

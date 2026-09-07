@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+"""Build private migration ledgers while emitting only stable status records."""
+
+from __future__ import annotations
+
+import hashlib
+from html.parser import HTMLParser
+import json
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+
+LIST_PREFIX = re.compile(r"^(?:[-+*]|\d+\.)\s+")
+TABLE_SEPARATOR = re.compile(r"^\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?$")
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def write_json_lines(path: Path, rows: list[dict[str, Any]]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        for row in rows:
+            stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")))
+            stream.write("\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def write_json_document(path: Path, document: dict[str, Any]) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(document, stream, sort_keys=True, separators=(",", ":"))
+        stream.write("\n")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def claim_row(
+    source_path: str, location: dict[str, Any], normalized_meaning: str
+) -> dict[str, Any]:
+    identity_input = json.dumps(
+        {
+            "source_path": source_path,
+            "location": location,
+            "normalized_meaning": normalized_meaning,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return {
+        "id": hashlib.sha256(identity_input).hexdigest(),
+        "source_path": source_path,
+        "location": location,
+        "normalized_meaning": normalized_meaning,
+        "disposition": "expected_output",
+        "owner": "migration",
+    }
+
+
+def markdown_claims(source_path: str, document: Path) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+    in_code_fence = False
+    for line_number, raw_line in enumerate(document.read_text(encoding="utf-8").splitlines(), 1):
+        text = raw_line.strip()
+        if text.startswith("```"):
+            in_code_fence = not in_code_fence
+            continue
+        if in_code_fence or not text or text.startswith("#") or TABLE_SEPARATOR.fullmatch(text):
+            continue
+        normalized = " ".join(LIST_PREFIX.sub("", text).split())
+        claims.append(
+            claim_row(
+                source_path,
+                {"kind": "line", "start": line_number},
+                normalized,
+            )
+        )
+    return claims
+
+
+class ClaimHtmlParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active_tag: str | None = None
+        self.fragments: list[str] = []
+        self.blocks: list[str] = []
+
+    def handle_starttag(
+        self, tag: str, attrs: list[tuple[str, str | None]]
+    ) -> None:
+        del attrs
+        if self.active_tag is None and tag in {"p", "li"}:
+            self.active_tag = tag
+            self.fragments = []
+
+    def handle_data(self, data: str) -> None:
+        if self.active_tag is not None:
+            self.fragments.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != self.active_tag:
+            return
+        normalized = " ".join("".join(self.fragments).split())
+        if normalized:
+            self.blocks.append(normalized)
+        self.active_tag = None
+        self.fragments = []
+
+
+def html_claims(source_path: str, document: Path) -> list[dict[str, Any]]:
+    parser = ClaimHtmlParser()
+    parser.feed(document.read_text(encoding="utf-8"))
+    return [
+        claim_row(source_path, {"kind": "html_block", "index": index}, meaning)
+        for index, meaning in enumerate(parser.blocks, 1)
+    ]
+
+
+def json_claims(source_path: str, document: Path) -> list[dict[str, Any]]:
+    claims: list[dict[str, Any]] = []
+
+    def escape_pointer(value: str) -> str:
+        return value.replace("~", "~0").replace("/", "~1")
+
+    def visit(value: Any, pointer: str) -> None:
+        if isinstance(value, dict):
+            for key in sorted(value):
+                visit(value[key], f"{pointer}/{escape_pointer(key)}")
+            return
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{pointer}/{index}")
+            return
+        rendered = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        claims.append(
+            claim_row(
+                source_path,
+                {"kind": "json_pointer", "pointer": pointer or "/"},
+                f"{pointer or '/'} = {rendered}",
+            )
+        )
+
+    with document.open(encoding="utf-8") as stream:
+        visit(json.load(stream), "")
+    return claims
+
+
+def build(config: dict[str, str]) -> int:
+    repository_root = Path(__file__).resolve().parent.parent
+    private_root = (repository_root / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ValueError("run_outside_private_root")
+
+    inventory_path = run_root / "private" / "manifests" / "inventory.jsonl"
+    sealed_tree = run_root / "sealed" / "tree"
+    inventory = read_json_lines(inventory_path)
+    manifest = {
+        row["path"]: row
+        for row in read_json_lines(
+            run_root / "private" / "manifests" / "original-before.jsonl"
+        )
+    }
+    claims: list[dict[str, Any]] = []
+    for item in inventory:
+        source_path = item["path"]
+        suffix = Path(source_path).suffix.lower()
+        if item["role"] == "derived_oracle" and suffix == ".md":
+            claims.extend(markdown_claims(source_path, sealed_tree / source_path))
+        elif item["role"] == "derived_oracle" and suffix in {".html", ".htm"}:
+            claims.extend(html_claims(source_path, sealed_tree / source_path))
+        elif item["role"] == "derived_oracle" and suffix == ".json":
+            claims.extend(json_claims(source_path, sealed_tree / source_path))
+    claims.sort(
+        key=lambda row: (
+            row["source_path"],
+            row["location"].get("start", row["location"].get("index", 0)),
+        )
+    )
+    write_json_lines(run_root / "private" / "claims.jsonl", claims)
+
+    license_evidence = sorted(
+        item["path"]
+        for item in inventory
+        if "license" in Path(item["path"]).name.lower()
+    )
+    provenance_evidence = sorted(
+        item["path"]
+        for item in inventory
+        if Path(item["path"]).name.lower().startswith(("created_", "readme"))
+    )
+    reference_baseline = [
+        {
+            "source_path": item["path"],
+            "sha256": manifest[item["path"]]["sha256"],
+            "version": {"state": "unknown"},
+            "provenance_evidence": provenance_evidence,
+            "license_evidence": license_evidence,
+            "disposition": "legacy_baseline",
+            "owner": "migration",
+        }
+        for item in inventory
+        if item["role"] == "reference_resource" and item["kind"] == "file"
+    ]
+    write_json_lines(
+        run_root / "private" / "reference-baseline.jsonl", reference_baseline
+    )
+
+    profile_path = run_root / "private" / "capability-profile.json"
+    capabilities: list[dict[str, Any]] = []
+    if profile_path.exists():
+        with profile_path.open(encoding="utf-8") as stream:
+            profile = json.load(stream)
+        profile_path.chmod(0o600)
+        inventory_by_path = {item["path"]: item for item in inventory}
+        for capability in profile["capabilities"]:
+            evidence_paths = capability["evidence_paths"]
+            if not evidence_paths or any(
+                evidence_path not in inventory_by_path
+                or inventory_by_path[evidence_path]["role"] not in {"skill", "code"}
+                for evidence_path in evidence_paths
+            ):
+                raise ValueError("invalid_capability_evidence")
+            capabilities.append(
+                {
+                    **capability,
+                    "disposition": "pending_replacement",
+                    "owner": "migration",
+                }
+            )
+    write_json_document(
+        run_root / "private" / "capabilities.json",
+        {"schema_version": 1, "capabilities": capabilities},
+    )
+    print('{"status":"ready"}')
+    return 0
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        return build(json.load(sys.stdin))
+    except Exception:
+        print('{"error":"migration_ledgers_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2,17 +2,17 @@
 
 ## Status
 
-**Plan state:** Approved. Implementation has not started.
+**Plan state:** Approved. Implementation is in progress under the gate evidence below.
 
 The checked-in Rust scaffold is intentionally disposable: it does not currently build because declared library modules and the CLI entry point are absent, and its initial model and migration do not yet enforce the reviewed contracts. Preserve useful vocabulary and types only where they survive the red-green slices below.
 
 | Gate | Status | Required outcome |
 |---|---|---|
-| 0. Protected migration oracle | Pending | Private corpus and legacy claims classified without changing the original repository |
-| 1. Synthetic evidence-ledger journey | Pending | One complete lab journey passes through library and CLI public seams |
-| 2. Ledger integrity and privacy | Pending | Mutation, reconciliation, quarantine, concurrency, and Expungement guarantees hold |
-| 3. Migration-required record slices | Pending | Every non-genomic migration input has a typed disposition and exercised record path |
-| 4. Genomics and reference data | Pending | Legacy and current genomic claims are complete, sourced, safe, and explainable |
+| 0. Protected migration oracle | Complete | Private corpus and legacy claims classified without changing the original repository |
+| 1. Synthetic evidence-ledger journey | Complete | One complete lab journey passes through library and CLI public seams |
+| 2. Ledger integrity and privacy | Complete | Mutation, reconciliation, quarantine, concurrency, and Expungement guarantees hold |
+| 3. Migration-required record slices | Complete | Every non-genomic migration input has a typed disposition and exercised record path |
+| 4. Genomics and reference data | In progress | Legacy and current genomic claims are complete, sourced, safe, and explainable |
 | 5. Analysis, reports, and skills | Pending | Familiar reports and thin skills derive only from Health Record and Analysis |
 | 6. Full replay and handoff | Pending | Repeatable full migration has zero unexplained differences and no unaccounted inputs |
 
@@ -253,6 +253,8 @@ Acceptance:
 - Every matching private input has an accepted, deduplicated, rejected, or quarantined disposition before work advances to the next domain.
 - Current views are derived from immutable history, and known errors and conflicts follow every related query and Analysis.
 - No private data appears in committed tests, snapshots, diagnostics, process arguments, or logs.
+
+Verification evidence (2026-08-02): synthetic public-interface contracts and fresh protected replays pass for labs, vitals, medications and supplements, conditions, Diagnostic Studies, Care Tasks, and Subject Preferences. Every exercised private subset is accepted or deliberately quarantined; the derived tracking choice remains a confirmation-required Migration Candidate rather than being promoted to a Fact. The verified capability inventory contains no distinct encounter input, so the migration-driven first release does not invent an encounter interface. `cargo test --locked` and strict all-target Clippy are green after the complete Gate 3 replay.
 
 ## Gate 4: Implement genomics and reference data
 

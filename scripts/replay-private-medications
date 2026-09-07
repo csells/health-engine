@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""Replay the private current regimen through public CLI seams without disclosure."""
+
+from __future__ import annotations
+
+from decimal import Decimal, InvalidOperation
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+HEADING_DATE = re.compile(r"Label-Verified\s+([A-Z][a-z]{2})\s+(\d{4})")
+TABLE_SEPARATOR = re.compile(r"^\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?$")
+NUMBERED_AMOUNT = re.compile(r"^(\d+(?:\.\d+)?)\s+(.+)$")
+ONE_AMOUNT = re.compile(r"\bone\s+([A-Za-z][A-Za-z -]*?)(?=\s+by\b|\s+once\b|\s*\(|$)", re.I)
+MONTHS = {
+    "Jan": 1,
+    "Feb": 2,
+    "Mar": 3,
+    "Apr": 4,
+    "May": 5,
+    "Jun": 6,
+    "Jul": 7,
+    "Aug": 8,
+    "Sep": 9,
+    "Oct": 10,
+    "Nov": 11,
+    "Dec": 12,
+}
+
+
+class ReplayError(Exception):
+    pass
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def run_cli(
+    binary: Path,
+    workspace: Path,
+    arguments: list[str],
+    payload: dict[str, Any],
+    log: Path,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(binary), "--workspace", str(workspace), "--json", *arguments],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        log.write_text(process.stderr, encoding="utf-8")
+        log.chmod(0o600)
+        raise ReplayError("cli_failed")
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("invalid_cli_output") from error
+
+
+def markdown_cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def normalized_identity(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def amount(value: str) -> dict[str, str] | None:
+    match = NUMBERED_AMOUNT.fullmatch(value)
+    if match:
+        return {"value": match.group(1), "unit": match.group(2), "original": value}
+    match = ONE_AMOUNT.search(value)
+    if match:
+        original = match.group(0)
+        return {"value": "1", "unit": match.group(1), "original": original}
+    return None
+
+
+def parse_regimen(document: Path) -> tuple[dict[str, int | str], list[dict[str, Any]]]:
+    lines = document.read_text(encoding="utf-8").splitlines()
+    clinical: dict[str, int | str] | None = None
+    subsection: str | None = None
+    events: list[dict[str, Any]] = []
+    for line_number, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        lower = stripped.lower()
+        if stripped.startswith("## ") and "current medications and supplements" in lower:
+            match = HEADING_DATE.search(stripped)
+            if not match or match.group(1) not in MONTHS:
+                raise ReplayError("regimen_date_invalid")
+            clinical = {
+                "year": int(match.group(2)),
+                "month": MONTHS[match.group(1)],
+                "source_text": match.group(0),
+            }
+            continue
+        if clinical is None:
+            continue
+        if stripped.startswith("## "):
+            break
+        if stripped.startswith("### "):
+            if "prescription medication" in lower:
+                subsection = "prescription"
+            elif "weekly injectable medication" in lower:
+                subsection = "weekly"
+            elif "supplement" in lower:
+                subsection = "supplement"
+            else:
+                subsection = None
+            continue
+        if (
+            subsection is None
+            or not stripped.startswith("|")
+            or TABLE_SEPARATOR.fullmatch(stripped)
+        ):
+            continue
+        cells = markdown_cells(stripped)
+        if cells and cells[0].lower() == "item":
+            continue
+        if len(cells) != 3 or any(not cell for cell in cells):
+            raise ReplayError("regimen_row_invalid")
+        name = cells[0]
+        if name.startswith("**") and name.endswith("**"):
+            name = name[2:-2]
+        if not name:
+            raise ReplayError("regimen_row_invalid")
+        strength = cells[1]
+        direction = cells[2]
+        product_kind = "supplement" if subsection == "supplement" else "medication"
+        if subsection == "supplement":
+            dose = amount(direction)
+            schedule = "every morning"
+            route = None
+        else:
+            dose = amount(direction)
+            schedule = direction
+            route = "oral" if "by mouth" in direction.lower() else None
+        events.append(
+            {
+                "line_number": line_number,
+                "event": "regimen_reported",
+                "product_kind": product_kind,
+                "name": name,
+                "normalized_identity": normalized_identity(name),
+                "strength": strength,
+                "dose": dose,
+                "route": route,
+                "schedule": schedule,
+                "indication": None,
+                "adherence_context": None,
+            }
+        )
+    if clinical is None or not events:
+        raise ReplayError("regimen_source_incomplete")
+    return clinical, events
+
+
+def change_set(
+    init: dict[str, Any], source_id: str, clinical: dict[str, int | str], events: list[dict[str, Any]]
+) -> dict[str, Any]:
+    reporter = {"kind": "subject", "identifier": "migration-subject"}
+    regions = [{"locator": f"line:{event['line_number']}"} for event in events]
+    changes = []
+    for event, region in zip(events, regions, strict=True):
+        payload = {key: value for key, value in event.items() if key != "line_number"}
+        changes.append(
+            {
+                "type": "add_fact",
+                "clinical_time": {
+                    "precision": "partial_date",
+                    "value": {
+                        "precision": "month",
+                        "year": clinical["year"],
+                        "month": clinical["month"],
+                    },
+                    "source_text": clinical["source_text"],
+                },
+                "evidence": {
+                    "type": "sourced_self_report",
+                    "source_id": source_id,
+                    "source_region": region,
+                    "reporter": reporter,
+                },
+                "fact": {"type": "medication_event", **payload},
+            }
+        )
+    return {
+        "schema_version": 1,
+        "workspace_id": init["workspace_id"],
+        "subject_id": init["subject_id"],
+        "expected_revision": init["record_revision"],
+        "idempotency_key": "private-current-regimen-v1",
+        "evidence_origin": {
+            "type": "parsed_self_report",
+            "source_id": source_id,
+            "reporter": reporter,
+        },
+        "extractor": {"name": "health-engine-current-regimen", "version": "1.0.0"},
+        "extraction_run": {
+            "source_id": source_id,
+            "coverage": {"regions": regions, "domains": ["medications"]},
+            "omissions": [],
+            "failures": [],
+            "resulting_candidate_keys": [region["locator"] for region in regions],
+        },
+        "changes": changes,
+    }
+
+
+def validate_fact(
+    fact: dict[str, Any], source_id: str, clinical: dict[str, int | str], expected: dict[str, Any]
+) -> None:
+    if fact.get("original_assurance") != "explicit_self_report":
+        raise ReplayError("assurance_mismatch")
+    evidence = fact.get("evidence", {})
+    if evidence.get("type") != "sourced_self_report" or evidence.get("source_id") != source_id:
+        raise ReplayError("evidence_mismatch")
+    if evidence.get("source_region", {}).get("locator") != f"line:{expected['line_number']}":
+        raise ReplayError("provenance_mismatch")
+    expected_time = {
+        "precision": "partial_date",
+        "value": {
+            "precision": "month",
+            "year": clinical["year"],
+            "month": clinical["month"],
+        },
+        "source_text": clinical["source_text"],
+    }
+    if fact.get("clinical_time") != expected_time:
+        raise ReplayError("clinical_time_mismatch")
+    actual = fact.get("fact", {})
+    expected_payload = {key: value for key, value in expected.items() if key != "line_number"}
+    expected_payload = {"type": "medication_event", **expected_payload}
+    for field in (
+        "type",
+        "event",
+        "product_kind",
+        "name",
+        "normalized_identity",
+        "strength",
+        "dose",
+        "route",
+        "schedule",
+        "indication",
+        "adherence_context",
+    ):
+        if actual.get(field) != expected_payload.get(field):
+            raise ReplayError(f"regimen_{field}_mismatch")
+
+
+def replay(config: dict[str, str]) -> None:
+    repository = Path(__file__).resolve().parent.parent
+    private_root = (repository / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    binary = Path(config["binary"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ReplayError("run_outside_private_root")
+    replay_name = config.get("replay_name", "medications-replay-v1")
+    prefix = "medications-replay-v"
+    if not replay_name.startswith(prefix) or not replay_name[len(prefix):].isdigit():
+        raise ReplayError("unsafe_replay_name")
+    inventory = read_json_lines(run_root / "private" / "manifests" / "inventory.jsonl")
+    source_path = "reports/current/health-summary.md"
+    if not any(item.get("path") == source_path and item.get("role") == "derived_oracle" for item in inventory):
+        raise ReplayError("regimen_source_missing")
+    source = run_root / "sealed" / "tree" / source_path
+    clinical, events = parse_regimen(source)
+
+    replay_root = run_root / "private" / replay_name
+    replay_root.mkdir(mode=0o700)
+    logs = replay_root / "logs"
+    logs.mkdir(mode=0o700)
+    target = replay_root / "migration" / "current-regimen.md"
+    target.parent.mkdir(mode=0o700)
+    shutil.copy2(source, target)
+    target.chmod(0o600)
+    init = run_cli(
+        binary,
+        replay_root,
+        ["workspace", "init"],
+        {"schema_version": 1, "subject_id": "migration-subject"},
+        logs / "init.log",
+    )
+    registered = run_cli(
+        binary,
+        replay_root,
+        ["source", "register"],
+        {"schema_version": 1, "alias": "migration/current-regimen.md", "media_type": "text/markdown"},
+        logs / "register.log",
+    )
+    source_id = registered["source_id"]
+    changes = change_set(init, source_id, clinical, events)
+    proposed = run_cli(binary, replay_root, ["record", "propose"], changes, logs / "propose.log")
+    apply_request = {
+        "schema_version": 1,
+        "proposal_id": proposed["proposal_id"],
+        "change_set": changes,
+    }
+    receipt = run_cli(binary, replay_root, ["record", "apply"], apply_request, logs / "apply.log")
+    retried = run_cli(binary, replay_root, ["record", "apply"], apply_request, logs / "retry.log")
+    if receipt != retried:
+        raise ReplayError("idempotency_mismatch")
+    queried = run_cli(
+        binary,
+        replay_root,
+        ["record", "query"],
+        {"schema_version": 1, "query": {"kind": "medication_event", "include_history": False}},
+        logs / "query.log",
+    )
+    facts = queried.get("facts", [])
+    by_region = {
+        fact.get("evidence", {}).get("source_region", {}).get("locator"): fact for fact in facts
+    }
+    if len(by_region) != len(events):
+        raise ReplayError("regimen_fact_count_mismatch")
+    for event in events:
+        fact = by_region.get(f"line:{event['line_number']}")
+        if fact is None:
+            raise ReplayError("regimen_fact_missing")
+        validate_fact(fact, source_id, clinical, event)
+    analysis = run_cli(
+        binary,
+        replay_root,
+        ["analysis", "run"],
+        {"schema_version": 1, "options": {"include_unverified": True}},
+        logs / "analysis.log",
+    )
+    analyzed_fact_ids = {
+        fact_id for claim in analysis.get("claims", []) for fact_id in claim.get("evidence_fact_ids", [])
+    }
+    if {fact["id"] for fact in facts} - analyzed_fact_ids:
+        raise ReplayError("analysis_evidence_incomplete")
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        replay(json.load(sys.stdin))
+        print('{"status":"verified"}')
+        return 0
+    except ReplayError as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError, InvalidOperation):
+        print('{"error":"private_medication_replay_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

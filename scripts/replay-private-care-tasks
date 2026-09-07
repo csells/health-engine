@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""Replay private open loops as source-faithful Care Tasks."""
+
+from __future__ import annotations
+
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+from typing import Any
+
+
+TABLE_SEPARATOR = re.compile(r"^\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?$")
+ISO_DATE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+MONTH_YEAR = re.compile(r"\bdue\s+~?([A-Z][a-z]{2})\s+(\d{4})\b", re.I)
+MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+class ReplayError(Exception):
+    pass
+
+
+def read_json_lines(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as stream:
+        return [json.loads(line) for line in stream if line.strip()]
+
+
+def run_cli(
+    binary: Path,
+    workspace: Path,
+    arguments: list[str],
+    payload: dict[str, Any],
+    log: Path,
+) -> dict[str, Any]:
+    process = subprocess.run(
+        [str(binary), "--workspace", str(workspace), "--json", *arguments],
+        input=json.dumps(payload, separators=(",", ":")),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if process.returncode != 0:
+        log.write_text(process.stderr, encoding="utf-8")
+        log.chmod(0o600)
+        raise ReplayError("cli_failed")
+    try:
+        return json.loads(process.stdout)
+    except json.JSONDecodeError as error:
+        raise ReplayError("invalid_cli_output") from error
+
+
+def cells(line: str) -> list[str]:
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def plain(value: str) -> str:
+    return " ".join(value.replace("**", "").replace("`", "").split())
+
+
+def task_number(row: list[str], raw: str) -> str:
+    first = plain(row[0]).lstrip("#")
+    if first.isdigit():
+        return first
+    match = re.search(r"#(\d+)\b", raw)
+    if not match:
+        raise ReplayError("care_task_number_missing")
+    return match.group(1)
+
+
+def task_status(section: str, text: str) -> str:
+    lower = plain(text).lower()
+    if "no action needed" in lower:
+        return "completed"
+    if "retracted" in lower or "withdrawn" in lower:
+        return "cancelled"
+    if "results pending" in lower or "drawn, pending" in lower or "result pending" in lower:
+        return "awaiting_result"
+    if "flagged and never chased" in section:
+        return "overdue"
+    if "stale" in section:
+        return "due"
+    return "pending"
+
+
+def task_kind(action: str, status: str) -> str:
+    lower = action.lower()
+    if status == "awaiting_result":
+        return "awaited_result"
+    if "appointment" in lower or " exam" in f" {lower}":
+        return "appointment"
+    if "referral" in lower:
+        return "referral"
+    if any(word in lower for word in ("test", "panel", "recheck", "level", "draw")):
+        return "repeat_test"
+    return "other"
+
+
+def task_due(text: str) -> dict[str, Any] | None:
+    lower = plain(text).lower()
+    if "week of" in lower and (match := ISO_DATE.search(text)):
+        return {"type": "on", "time": {"precision": "date", "value": match.group(1)}}
+    if match := MONTH_YEAR.search(plain(text)):
+        month = MONTHS.get(match.group(1).lower())
+        if month is None:
+            raise ReplayError("care_task_due_month_invalid")
+        return {
+            "type": "on",
+            "time": {
+                "precision": "partial_date",
+                "value": {"precision": "month", "year": int(match.group(2)), "month": month},
+            },
+        }
+    if re.search(r"\bannual(?:ly)?\b", lower):
+        return {"type": "interval", "value": 1, "unit": "years", "source_text": "annual"}
+    return None
+
+
+def parse_tasks(document: Path) -> tuple[str, list[dict[str, Any]]]:
+    lines = document.read_text(encoding="utf-8").splitlines()
+    updated = None
+    section = ""
+    tasks: list[dict[str, Any]] = []
+    relevant = (
+        "ordered and drawn",
+        "recommended and never done",
+        "flagged and never chased",
+        "stale",
+    )
+    for line_number, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if "last updated:" in stripped.lower() and (match := ISO_DATE.search(stripped)):
+            updated = match.group(1)
+        if stripped.startswith("## "):
+            section = plain(stripped[3:]).lower()
+            continue
+        section_class = next((prefix for prefix in relevant if prefix in section), None)
+        if section_class is None:
+            continue
+        if not stripped.startswith("|") or TABLE_SEPARATOR.fullmatch(stripped):
+            continue
+        row = cells(stripped)
+        if not row or plain(row[0]).lower() in {"#", "test", "item"}:
+            continue
+        number = task_number(row, stripped)
+        action_cell = row[0] if plain(row[0]).lower() not in {number, f"#{number}"} else row[1]
+        action = plain(action_cell)
+        if not action:
+            raise ReplayError("care_task_action_missing")
+        status = task_status(section, stripped)
+        provider = re.search(r"\bDr\.\s+[A-Z][A-Za-z'’-]+", plain(stripped))
+        tasks.append(
+            {
+                "locator": f"line:{line_number}",
+                "task_key": f"open-loop-{section_class.replace(' ', '-')}-{number}",
+                "kind": task_kind(action, status),
+                "status": status,
+                "action": action,
+                "due": task_due(stripped),
+                "requested_by": provider.group(0) if provider else None,
+                "source_text": stripped,
+            }
+        )
+    keys = [task["task_key"] for task in tasks]
+    if updated is None:
+        raise ReplayError("care_task_last_updated_missing")
+    if not tasks:
+        raise ReplayError("care_task_rows_missing")
+    if len(keys) != len(set(keys)):
+        raise ReplayError("care_task_keys_duplicate")
+    return updated, tasks
+
+
+def build_change_set(
+    init: dict[str, Any], source_id: str, updated: str, tasks: list[dict[str, Any]]
+) -> dict[str, Any]:
+    reporter = {"kind": "subject", "identifier": "migration-subject"}
+    regions = [{"locator": task["locator"]} for task in tasks]
+    changes = []
+    for task in tasks:
+        payload = {key: value for key, value in task.items() if key != "locator" and value is not None}
+        changes.append(
+            {
+                "type": "add_fact",
+                "clinical_time": {"precision": "date", "value": updated, "source_text": updated},
+                "evidence": {
+                    "type": "sourced_self_report",
+                    "source_id": source_id,
+                    "source_region": {"locator": task["locator"]},
+                    "reporter": reporter,
+                },
+                "fact": {"type": "care_task", **payload},
+            }
+        )
+    return {
+        "schema_version": 1,
+        "workspace_id": init["workspace_id"],
+        "subject_id": init["subject_id"],
+        "expected_revision": init["record_revision"],
+        "idempotency_key": "private-open-care-tasks-v1",
+        "evidence_origin": {
+            "type": "parsed_self_report",
+            "source_id": source_id,
+            "reporter": reporter,
+        },
+        "extractor": {"name": "health-engine-open-loops", "version": "1.0.0"},
+        "extraction_run": {
+            "source_id": source_id,
+            "coverage": {"regions": regions, "domains": ["care_tasks"]},
+            "omissions": [],
+            "failures": [],
+            "resulting_candidate_keys": [task["locator"] for task in tasks],
+        },
+        "changes": changes,
+    }
+
+
+def validate_fact(
+    fact: dict[str, Any], source_id: str, updated: str, expected: dict[str, Any]
+) -> None:
+    if fact.get("original_assurance") != "explicit_self_report":
+        raise ReplayError("care_task_assurance_mismatch")
+    if fact.get("clinical_time") != {"precision": "date", "value": updated, "source_text": updated}:
+        raise ReplayError("care_task_time_mismatch")
+    evidence = fact.get("evidence", {})
+    if evidence.get("type") != "sourced_self_report" or evidence.get("source_id") != source_id:
+        raise ReplayError("care_task_evidence_mismatch")
+    if evidence.get("source_region", {}).get("locator") != expected["locator"]:
+        raise ReplayError("care_task_provenance_mismatch")
+    actual = fact.get("fact", {})
+    expected_payload = {key: value for key, value in expected.items() if key != "locator" and value is not None}
+    expected_payload = {"type": "care_task", **expected_payload}
+    for field in (
+        "type", "task_key", "kind", "status", "action", "due", "requested_by", "source_text"
+    ):
+        if actual.get(field) != expected_payload.get(field):
+            raise ReplayError(f"care_task_{field}_mismatch")
+
+
+def replay(config: dict[str, str]) -> None:
+    repository = Path(__file__).resolve().parent.parent
+    private_root = (repository / "tmp").resolve()
+    run_root = Path(config["run_root"]).resolve(strict=True)
+    binary = Path(config["binary"]).resolve(strict=True)
+    if run_root == private_root or private_root not in run_root.parents:
+        raise ReplayError("run_outside_private_root")
+    replay_name = config.get("replay_name", "care-tasks-replay-v1")
+    prefix = "care-tasks-replay-v"
+    if not replay_name.startswith(prefix) or not replay_name[len(prefix):].isdigit():
+        raise ReplayError("unsafe_replay_name")
+    source_path = "reports/current/open-loops.md"
+    inventory = read_json_lines(run_root / "private" / "manifests" / "inventory.jsonl")
+    if not any(item.get("path") == source_path and item.get("role") == "derived_oracle" for item in inventory):
+        raise ReplayError("care_task_source_missing")
+    source = run_root / "sealed" / "tree" / source_path
+    updated, tasks = parse_tasks(source)
+    replay_root = run_root / "private" / replay_name
+    replay_root.mkdir(mode=0o700)
+    logs = replay_root / "logs"
+    logs.mkdir(mode=0o700)
+    target = replay_root / "migration" / "open-loops.md"
+    target.parent.mkdir(mode=0o700)
+    shutil.copy2(source, target)
+    target.chmod(0o600)
+    init = run_cli(
+        binary, replay_root, ["workspace", "init"],
+        {"schema_version": 1, "subject_id": "migration-subject"}, logs / "init.log",
+    )
+    registered = run_cli(
+        binary, replay_root, ["source", "register"],
+        {"schema_version": 1, "alias": "migration/open-loops.md", "media_type": "text/markdown"},
+        logs / "register.log",
+    )
+    source_id = registered["source_id"]
+    changes = build_change_set(init, source_id, updated, tasks)
+    proposed = run_cli(binary, replay_root, ["record", "propose"], changes, logs / "propose.log")
+    request = {"schema_version": 1, "proposal_id": proposed["proposal_id"], "change_set": changes}
+    receipt = run_cli(binary, replay_root, ["record", "apply"], request, logs / "apply.log")
+    if receipt != run_cli(binary, replay_root, ["record", "apply"], request, logs / "retry.log"):
+        raise ReplayError("care_task_idempotency_mismatch")
+    queried = run_cli(
+        binary, replay_root, ["record", "query"],
+        {"schema_version": 1, "query": {"kind": "care_task", "include_history": False}},
+        logs / "query.log",
+    )
+    facts = queried.get("facts", [])
+    by_key = {fact.get("fact", {}).get("task_key"): fact for fact in facts}
+    if len(by_key) != len(tasks):
+        raise ReplayError("care_task_fact_count_mismatch")
+    for task in tasks:
+        fact = by_key.get(task["task_key"])
+        if fact is None:
+            raise ReplayError("care_task_fact_missing")
+        validate_fact(fact, source_id, updated, task)
+    analysis = run_cli(
+        binary, replay_root, ["analysis", "run"],
+        {"schema_version": 1, "options": {"include_unverified": True}}, logs / "analysis.log",
+    )
+    analyzed = {
+        fact_id for claim in analysis.get("claims", []) for fact_id in claim.get("evidence_fact_ids", [])
+    }
+    if {fact["id"] for fact in facts} - analyzed:
+        raise ReplayError("care_task_analysis_incomplete")
+
+
+def main() -> int:
+    try:
+        os.umask(0o077)
+        replay(json.load(sys.stdin))
+        print('{"status":"verified"}')
+        return 0
+    except ReplayError as error:
+        print(json.dumps({"error": str(error)}, separators=(",", ":")), file=sys.stderr)
+        return 1
+    except (KeyError, OSError, ValueError, IndexError):
+        print('{"error":"private_care_task_replay_failed"}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
